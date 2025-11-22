@@ -4192,7 +4192,7 @@ optimize_low_spec() {
 
     # TCP拥塞控制（核心）
     echo -e "${gl_lv}优化TCP拥塞控制...${gl_bai}"
-    sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null
+    net.ipv4.tcp_congestion_control=bbr 2>/dev/null
     echo "  ✓ tcp_congestion_control = bbr"
     current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     if [ "$current_qdisc" = "cake" ]; then
@@ -4203,47 +4203,47 @@ optimize_low_spec() {
 
     # TCP连接优化（核心功能）
     echo -e "${gl_lv}优化TCP连接...${gl_bai}"
-    sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null
+    net.ipv4.tcp_fastopen=3 2>/dev/null
     echo "  ✓ tcp_fastopen = 3"
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null
+    net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null
     echo "  ✓ tcp_slow_start_after_idle = 0 （关键优化）"
-    sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null
+    net.ipv4.tcp_tw_reuse=1 2>/dev/null
     echo "  ✓ tcp_tw_reuse = 1"
-    sysctl -w net.ipv4.ip_local_port_range='1024 65535' 2>/dev/null
+    net.ipv4.ip_local_port_range='1024 65535' 2>/dev/null
     echo "  ✓ ip_local_port_range = 1024-65535"
 
     # TCP缓冲区（8MB保守配置）
     echo -e "${gl_lv}优化TCP缓冲区（8MB保守配置）...${gl_bai}"
-    sysctl -w net.core.rmem_max=8388608 2>/dev/null
+    net.core.rmem_max=8388608 2>/dev/null
     echo "  ✓ rmem_max = 8MB"
-    sysctl -w net.core.wmem_max=8388608 2>/dev/null
+    net.core.wmem_max=8388608 2>/dev/null
     echo "  ✓ wmem_max = 8MB"
-    sysctl -w net.ipv4.tcp_rmem='4096 87380 8388608' 2>/dev/null
+    net.ipv4.tcp_rmem='4096 87380 8388608' 2>/dev/null
     echo "  ✓ tcp_rmem = 4K 85K 8MB"
-    sysctl -w net.ipv4.tcp_wmem='4096 65536 8388608' 2>/dev/null
+    net.ipv4.tcp_wmem='4096 65536 8388608' 2>/dev/null
     echo "  ✓ tcp_wmem = 4K 64K 8MB"
 
     # 内存管理（保守安全）
     echo -e "${gl_lv}优化内存管理...${gl_bai}"
-    sysctl -w vm.swappiness=10 2>/dev/null
+    vm.swappiness=10 2>/dev/null
     echo "  ✓ swappiness = 10 （安全值）"
-    sysctl -w vm.dirty_ratio=20 2>/dev/null
+    vm.dirty_ratio=20 2>/dev/null
     echo "  ✓ dirty_ratio = 20"
-    sysctl -w vm.dirty_background_ratio=10 2>/dev/null
+    vm.dirty_background_ratio=10 2>/dev/null
     echo "  ✓ dirty_background_ratio = 10"
 
     # 连接队列（适度配置）
     echo -e "${gl_lv}优化连接队列...${gl_bai}"
-    sysctl -w net.core.somaxconn=2048 2>/dev/null
+    net.core.somaxconn=2048 2>/dev/null
     echo "  ✓ somaxconn = 2048"
-    sysctl -w net.ipv4.tcp_max_syn_backlog=4096 2>/dev/null
+    net.ipv4.tcp_max_syn_backlog=4096 2>/dev/null
     echo "  ✓ tcp_max_syn_backlog = 4096"
-    sysctl -w net.core.netdev_max_backlog=2500 2>/dev/null
+    net.core.netdev_max_backlog=2500 2>/dev/null
     echo "  ✓ netdev_max_backlog = 2500"
 
     # TCP安全
     echo -e "${gl_lv}TCP安全增强...${gl_bai}"
-    sysctl -w net.ipv4.tcp_syncookies=1 2>/dev/null
+    net.ipv4.tcp_syncookies=1 2>/dev/null
     echo "  ✓ tcp_syncookies = 1"
 
     echo ""
