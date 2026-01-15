@@ -71,15 +71,20 @@ uninstall_alias() {
     # 如果失败，则只删除别名块本身
     if grep -q "^# ================" "$RC_FILE" 2>/dev/null; then
         # 尝试删除从分隔线开始到别名结束的整个块
-        sed '/^# ================/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE" 2>/dev/null
+        sed '/^# ================/,/^alias dog=/d' "$RC_FILE" > "$TEMP_FILE" 2>/dev/null
+        # 兼容旧版本只有 bbr 的情况
+        if grep -q "net-tcp-tune 快捷别名" "$TEMP_FILE" 2>/dev/null; then
+             sed '/^# ================/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE" 2>/dev/null
+        fi
+
         # 检查是否还有别名残留
         if grep -q "net-tcp-tune 快捷别名" "$TEMP_FILE" 2>/dev/null; then
             # 如果还有残留，使用更精确的删除
-            sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
+            sed '/net-tcp-tune 快捷别名/,/^alias dog=/d' "$RC_FILE" > "$TEMP_FILE"
         fi
     else
         # 直接删除别名块
-        sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
+        sed '/net-tcp-tune 快捷别名/,/^alias dog=/d' "$RC_FILE" > "$TEMP_FILE"
     fi
     
     # 检查是否有变更
@@ -122,11 +127,32 @@ install_alias() {
 # 使用时间戳参数确保每次都获取最新版本，避免缓存
 # ========================================
 alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/net-tcp-tune.sh?\$(date +%s)\")"
+alias dog="bash <(curl -fsSL \"https://raw.githubusercontent.com/Eric86777/vps-tcp-tune/main/Eric_port-traffic-dog.sh?\$(date +%s)\")"
 '
     
     # 检查别名是否已存在
     if grep -q "net-tcp-tune 快捷别名" "$RC_FILE" 2>/dev/null; then
-        echo -e "${YELLOW}别名已存在，跳过安装${NC}"
+        echo -e "${YELLOW}配置已存在，正在更新...${NC}"
+        
+        # 备份文件
+        cp "$RC_FILE" "${RC_FILE}.bak"
+        
+        # 方案：读取文件，过滤掉原来的 alias dog= 行，然后再追加新的
+        # 1. 如果有旧的块结构，尝试整体替换（兼容旧版）
+        if grep -q "^# ================" "$RC_FILE" 2>/dev/null; then
+             sed -i '/^# ================/,/^alias dog=/d' "$RC_FILE" 2>/dev/null || sed -i '/^# ================/,/^alias bbr=/d' "$RC_FILE"
+        else
+             sed -i '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE"
+        fi
+
+        # 2. ⚡️暴力清理：确保没有残留的 alias dog= 行 (这是为了修复之前 sed 没删干净的情况)
+        if grep -q "alias dog=" "$RC_FILE"; then
+            grep -v "alias dog=" "$RC_FILE" > "${RC_FILE}.tmp" && mv "${RC_FILE}.tmp" "$RC_FILE"
+        fi
+        
+        # 再添加新的
+        echo "$ALIAS_CONTENT" >> "$RC_FILE"
+        echo -e "${GREEN}✅ 别名已更新到 ${RC_FILE}${NC}"
         echo ""
     else
         # 添加别名到配置文件
@@ -137,7 +163,8 @@ alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/Eric86777/vps-t
     
     echo -e "${CYAN}=== 快捷命令 ===${NC}"
     echo ""
-    echo -e "  ${GREEN}bbr${NC}   - 一键运行脚本"
+    echo -e "  ${GREEN}bbr${NC}   - 一键运行系统优化脚本"
+    echo -e "  ${GREEN}dog${NC}   - 一键运行端口流量狗"
     echo ""
     echo -e "${CYAN}=== 使用方法 ===${NC}"
     echo ""
@@ -147,7 +174,8 @@ alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/Eric86777/vps-t
     echo "2. 或者关闭终端重新打开"
     echo ""
     echo "3. 然后直接输入快捷命令："
-    echo -e "   ${GREEN}bbr${NC}"
+    echo -e "   ${GREEN}bbr${NC}  (系统优化)"
+    echo -e "   ${GREEN}dog${NC}  (端口监控)"
     echo ""
     echo -e "${CYAN}=== 卸载方法 ===${NC}"
     echo ""

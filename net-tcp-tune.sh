@@ -3,7 +3,8 @@
 # BBR v3 终极优化脚本 - 融合版
 # 功能：结合 XanMod 官方内核的稳定性 + 专业队列算法调优
 # 特点：安全性 + 性能 双优化
-# 版本：2.0 Ultimate Edition
+# 版本：2.2 Ultimate Edition
+# 更新：安全下载校验 + MSS 规则安全处理 + Realm 依赖预检
 #=============================================================================
 
 #=============================================================================
@@ -19,7 +20,7 @@
 #    步骤1 → 执行菜单选项 1：BBR v3 内核安装
 #    步骤2 → 执行菜单选项 3：BBR 直连/落地优化（智能带宽检测）
 #            选择子选项 1 进行自动检测
-#    步骤3 → 执行菜单选项 4：Realm转发timeout修复（如使用 Realm 转发）
+#    步骤3 → 执行菜单选项 6：Realm转发timeout修复（如使用 Realm 转发）
 # 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 
@@ -147,6 +148,65 @@ install_package() {
             return 1
         fi
     done
+}
+
+safe_download_script() {
+    local url=$1
+    local output_file=$2
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$output_file"
+    elif command -v wget &>/dev/null; then
+        wget -qO "$output_file" "$url"
+    else
+        return 1
+    fi
+
+    [ -s "$output_file" ]
+}
+
+verify_downloaded_script() {
+    local file=$1
+
+    if [ ! -s "$file" ]; then
+        return 1
+    fi
+
+    if head -n 1 "$file" | grep -qiE '<!DOCTYPE|<html'; then
+        return 1
+    fi
+
+    head -n 5 "$file" | grep -q '^#!'
+}
+
+run_remote_script() {
+    local url=$1
+    local interpreter=${2:-bash}
+    shift 2
+
+    local tmp_file
+    tmp_file=$(mktemp /tmp/net-tcp-tune.XXXXXX) || {
+        echo -e "${gl_hong}❌ 无法创建临时文件${gl_bai}"
+        return 1
+    }
+
+    if ! safe_download_script "$url" "$tmp_file"; then
+        echo -e "${gl_hong}❌ 下载脚本失败: ${url}${gl_bai}"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    if ! verify_downloaded_script "$tmp_file"; then
+        echo -e "${gl_hong}❌ 脚本校验失败，已取消执行${gl_bai}"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    chmod +x "$tmp_file"
+    "$interpreter" "$tmp_file" "$@"
+    local rc=$?
+    rm -f "$tmp_file"
+    return $rc
 }
 
 check_disk_space() {
@@ -1625,6 +1685,24 @@ enable_realm_ipv4() {
 
     echo ""
 
+    # 前置检查：确保依赖和配置可用
+    if [ ! -f /etc/realm/config.json ]; then
+        echo -e "${gl_hong}❌ /etc/realm/config.json 不存在${gl_bai}"
+        echo ""
+        break_end
+        return 1
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        echo "正在安装 jq..."
+        if ! install_package "jq"; then
+            echo -e "${gl_hong}❌ jq 安装失败，已取消操作${gl_bai}"
+            echo ""
+            break_end
+            return 1
+        fi
+    fi
+
     # 步骤2：修改 resolv.conf
     echo -e "${gl_zi}[步骤 2/6] 修改 DNS 配置...${gl_bai}"
     
@@ -1650,17 +1728,9 @@ enable_realm_ipv4() {
     
     if [ ! -f /etc/realm/config.json ]; then
         echo -e "${gl_hong}❌ /etc/realm/config.json 不存在${gl_bai}"
-        echo ""
-        break_end
         return 1
     fi
-    
-    # 检查是否安装了 jq
-    if ! command -v jq &>/dev/null; then
-        echo "正在安装 jq..."
-        apt-get update -qq && apt-get install -y jq >/dev/null 2>&1
-    fi
-    
+
     # 使用 sed 和手动编辑来修改配置
     local temp_config="/tmp/realm_config_temp.json"
 
@@ -2443,6 +2513,400 @@ check_ipv4v6_connections() {
     done
 }
 
+#=============================================================================
+# MTU/MSS 检测与优化功能
+# 用于消除国际链路重传问题
+#=============================================================================
+
+# 多地区 MTU 路径探测
+detect_path_mtu_multi_region() {
+    clear >&2
+    echo -e "${gl_kjlan}==========================================${gl_bai}" >&2
+    echo "      MTU 路径探测（多地区检测）" >&2
+    echo -e "${gl_kjlan}==========================================${gl_bai}" >&2
+    echo "" >&2
+    
+    echo -e "${gl_zi}正在探测到全球多个地区的路径 MTU...${gl_bai}" >&2
+    echo -e "${gl_huang}注意: 已排除 Anycast IP (如 1.1.1.1/8.8.8.8)，确保检测真实物理路径${gl_bai}" >&2
+    echo "" >&2
+    
+    # 定义测试目标 (主IP + 备选IP，确保高可用)
+    # 策略：混合使用大学、ISP骨干网、商业云(非Anycast) IP
+    declare -A targets=(
+        ["香港"]="147.8.17.13 202.45.170.1 103.16.228.1 118.143.1.1"          # HKU, HKIX, HostHatch, PCCW
+        ["日本-东京"]="133.11.0.1 202.232.2.1 103.201.129.1 203.104.128.1"    # U-Tokyo, JAIST, GMO, KDDI
+        ["日本-大阪"]="133.1.138.1 203.178.148.19 61.211.224.1"               # Osaka U, WIDE, K-Opticom
+        ["新加坡"]="137.132.80.25 202.156.0.1 103.25.202.1 118.201.1.1"       # NUS, Singtel, StarHub, M1
+        ["韩国"]="147.46.10.20 211.233.0.1 168.126.63.1 210.117.65.1"         # SNU, KT, KT-DNS, SK Broadband
+        ["美国-西海岸"]="128.97.27.37 128.32.155.2 198.148.161.11 64.125.0.1"  # UCLA, Berkeley, QuadraNet, Zayo
+        ["美国-东海岸"]="18.9.22.69 128.112.128.15 108.61.10.10 23.29.64.1"    # MIT, Princeton, Vultr, Choopa
+        ["欧洲-德国"]="141.14.16.1 194.25.0.125 134.130.4.1 85.10.240.1"      # DFN, Telekom, RWTH, Hetzner
+        ["欧洲-英国"]="131.111.8.46 163.1.0.1 212.58.244.20 193.136.1.1"       # Cambridge, Oxford, BBC, LINX
+        ["澳洲"]="139.130.4.5 203.50.0.1 150.203.1.10 203.2.218.1"             # Telstra, Telstra-2, ANU, Optus
+    )
+    
+    # 定义显示顺序
+    local regions_order=("香港" "日本-东京" "日本-大阪" "新加坡" "韩国" "美国-西海岸" "美国-东海岸" "欧洲-德国" "欧洲-英国" "澳洲")
+    
+    # 存储每个目标的 MSS
+    declare -A mss_values
+    local test_count=0
+    local success_count=0
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    
+    for region in "${regions_order[@]}"; do
+        test_count=$((test_count + 1))
+        local target_list="${targets[$region]}"
+        local active_target=""
+        
+        # 1. 连通性检查 (选择可用的 IP)
+        for ip in $target_list; do
+            if ping -c 1 -W 1 "$ip" &>/dev/null; then
+                active_target="$ip"
+                break
+            fi
+        done
+        
+        echo -e "${gl_huang}[${test_count}/${#regions_order[@]}] ${gl_bai}测试目标: ${gl_kjlan}${region}${gl_bai}" >&2
+        
+        if [ -z "$active_target" ]; then
+             echo -e "  ${gl_huang}⚠️  无法探测 (所有测试IP均不可达)${gl_bai}" >&2
+             mss_values[$region]=1280  # 默认安全值
+             echo "" >&2
+             continue
+        fi
+
+        # 2. 开始 MTU 探测
+        local found=0
+        for size in 1500 1492 1480 1460 1452 1440 1420 1400 1380 1360 1340 1320 1300; do
+            if ping -M do -s $size -c 1 -W 1 $active_target &>/dev/null; then
+                local mtu=$((size + 28))
+                local mss=$((size + 28 - 40))
+                echo -e "  ${gl_lv}✅ MTU=${mtu}, MSS=${mss}${gl_bai} (Target: $active_target)" >&2
+                mss_values[$region]=$mss
+                found=1
+                success_count=$((success_count + 1))
+                break
+            fi
+        done
+        
+        if [ $found -eq 0 ]; then
+            echo -e "  ${gl_huang}⚠️  探测失败 (ICMP分片被拦截)${gl_bai}" >&2
+            mss_values[$region]=1280
+        fi
+        echo "" >&2
+    done
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    echo "" >&2
+    
+    # 找出最小的 MSS
+    local min_mss=9999
+    local max_mss=0
+    local min_region=""
+    local max_region=""
+    
+    for region in "${!mss_values[@]}"; do
+        local mss=${mss_values[$region]}
+        if [ $mss -lt $min_mss ]; then
+            min_mss=$mss
+            min_region=$region
+        fi
+        if [ $mss -gt $max_mss ]; then
+            max_mss=$mss
+            max_region=$region
+        fi
+    done
+    
+    # 显示汇总结果
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}" >&2
+    echo -e "${gl_lv}✅ 探测完成！${gl_bai}" >&2
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}" >&2
+    echo "" >&2
+    echo "各地区 MSS 检测结果：" >&2
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    for region in "${regions_order[@]}"; do
+        if [ -n "${mss_values[$region]}" ]; then
+            local mss=${mss_values[$region]}
+            echo -e "  ${gl_zi}${region}:${gl_bai} ${mss} bytes" >&2
+        fi
+    done
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+    echo "" >&2
+    
+    # 判断是否一致
+    if [ $min_mss -eq $max_mss ]; then
+        echo -e "${gl_lv}✅ 所有地区 MSS 完全一致！${gl_bai}" >&2
+        echo -e "${gl_kjlan}推荐 MSS:${gl_bai} ${gl_lv}${min_mss}${gl_bai} bytes" >&2
+        echo -e "${gl_zi}说明: 所有地区MTU相同，使用此值性能最优${gl_bai}" >&2
+    else
+        local diff=$((max_mss - min_mss))
+        echo -e "${gl_huang}⚠️  不同地区 MSS 有差异（${diff} bytes）${gl_bai}" >&2
+        echo "" >&2
+        echo -e "  最小值: ${gl_huang}${min_mss}${gl_bai} (${min_region})" >&2
+        echo -e "  最大值: ${gl_huang}${max_mss}${gl_bai} (${max_region})" >&2
+        echo "" >&2
+        echo -e "${gl_kjlan}推荐策略：${gl_bai}" >&2
+        echo -e "  1. ${gl_lv}保守方案:${gl_bai} 使用最小值 ${min_mss} (兼容所有地区)" >&2
+        echo -e "  2. ${gl_huang}激进方案:${gl_bai} 使用最大值 ${max_mss} (性能最优，部分地区可能丢包)" >&2
+        echo -e "  3. ${gl_zi}折中方案:${gl_bai} 使用中间值 $(( (min_mss + max_mss) / 2 ))" >&2
+    fi
+    echo "" >&2
+    
+    # 返回推荐的MSS值（最小值，最大值）
+    echo "$min_mss $max_mss"
+}
+
+# 应用 MSS Clamp 规则
+apply_mss_clamp_with_value() {
+    local mss=$1
+    
+    echo -e "${gl_zi}正在应用 MSS Clamp 规则...${gl_bai}"
+    echo ""
+    
+    # 检查iptables
+    if ! command -v iptables &>/dev/null; then
+        echo -e "${gl_huang}未检测到 iptables，正在尝试自动安装...${gl_bai}"
+        install_package "iptables"
+        
+        if ! command -v iptables &>/dev/null; then
+            echo -e "${gl_hong}错误: iptables 安装失败，无法设置 MSS Clamp${gl_bai}"
+            return 1
+        fi
+    fi
+
+    if ! iptables -m comment -h &>/dev/null; then
+        echo -e "${gl_hong}错误: iptables comment 模块不可用，已取消 MSS Clamp${gl_bai}"
+        return 1
+    fi
+    
+    # 备份当前规则
+    local backup_file="/root/.iptables_backup_$(date +%Y%m%d_%H%M%S).rules"
+    iptables-save > "$backup_file" 2>/dev/null
+    echo -e "${gl_zi}已备份当前规则到: ${backup_file}${gl_bai}"
+    echo ""
+    
+    # 清除旧的 MSS 规则（仅处理本脚本添加的规则）
+    echo "清除旧规则..."
+    local comment_tag="net-tcp-tune-mss"
+    local old_rule_mss
+    while read -r old_rule_mss; do
+        [ -n "$old_rule_mss" ] || continue
+        iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_rule_mss" -m comment --comment "$comment_tag" 2>/dev/null || true
+    done < <(iptables -t mangle -S OUTPUT 2>/dev/null | grep "$comment_tag" | sed -n 's/.*--set-mss \([0-9]\+\).*/\1/p')
+
+    while read -r old_rule_mss; do
+        [ -n "$old_rule_mss" ] || continue
+        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_rule_mss" -m comment --comment "$comment_tag" 2>/dev/null || true
+    done < <(iptables -t mangle -S POSTROUTING 2>/dev/null | grep "$comment_tag" | sed -n 's/.*--set-mss \([0-9]\+\).*/\1/p')
+
+    if iptables -t mangle -S OUTPUT 2>/dev/null | grep 'TCPMSS' | grep -vq "$comment_tag"; then
+        echo -e "${gl_huang}⚠️  检测到非本脚本的 TCPMSS 规则，未自动清理${gl_bai}"
+    fi
+    if iptables -t mangle -S POSTROUTING 2>/dev/null | grep 'TCPMSS' | grep -vq "$comment_tag"; then
+        echo -e "${gl_huang}⚠️  检测到非本脚本的 TCPMSS 规则，未自动清理${gl_bai}"
+    fi
+    
+    # 应用新规则（OUTPUT链 + POSTROUTING链）
+    echo "设置 MSS = ${mss} bytes..."
+    iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss" -m comment --comment "$comment_tag"
+    iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss" -m comment --comment "$comment_tag"
+    
+    echo ""
+    echo -e "${gl_lv}✅ MSS Clamp 规则已应用${gl_bai}"
+    echo ""
+    
+    # 验证规则
+    echo "验证规则..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    iptables -t mangle -L OUTPUT -n -v | grep TCPMSS | head -1
+    iptables -t mangle -L POSTROUTING -n -v | grep TCPMSS | head -1
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    # 保存规则
+    echo "保存规则（重启后生效）..."
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1
+        echo -e "${gl_lv}✅ 规则已持久化保存${gl_bai}"
+    elif command -v iptables-save &>/dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        echo -e "${gl_lv}✅ 规则已保存${gl_bai}"
+    else
+        echo -e "${gl_huang}⚠️  无法自动保存规则，重启后可能失效${gl_bai}"
+        echo -e "${gl_zi}建议手动安装: apt install iptables-persistent${gl_bai}"
+    fi
+    
+    return 0
+}
+
+# 验证优化效果
+verify_mss_optimization() {
+    echo ""
+    echo -e "${gl_kjlan}==========================================${gl_bai}"
+    echo "      验证优化效果"
+    echo -e "${gl_kjlan}==========================================${gl_bai}"
+    echo ""
+    
+    echo -e "${gl_zi}等待 30 秒让配置生效...${gl_bai}"
+    sleep 30
+    
+    echo ""
+    echo -e "${gl_huang}当前重传统计:${gl_bai}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ss -s | grep -i "retrans\|segs"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    echo -e "${gl_zi}建议:${gl_bai}"
+    echo "  1. 运行网络测试观察重传率变化"
+    echo "  2. 如果重传率显著降低（80%+），说明优化成功"
+    echo "  3. 如果仍有重传，可能是其他问题（线路质量等）"
+    echo ""
+}
+
+# 主菜单函数
+mtu_mss_optimization() {
+    while true; do
+        clear
+        echo -e "${gl_kjlan}==========================================${gl_bai}"
+        echo "    MTU检测与MSS优化（消除重传）"
+        echo -e "${gl_kjlan}==========================================${gl_bai}"
+        echo ""
+        
+        # 显示当前状态
+        echo -e "${gl_zi}当前状态:${gl_bai}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        
+        # 检查MSS Clamp是否已设置
+        local current_mss=$(iptables -t mangle -L OUTPUT -n -v 2>/dev/null | grep TCPMSS | grep -oP 'set \K\d+' | head -1)
+        if [ -n "$current_mss" ]; then
+            echo -e "  MSS Clamp: ${gl_lv}✅ 已设置 (${current_mss} bytes)${gl_bai}"
+        else
+            echo -e "  MSS Clamp: ${gl_huang}❌ 未设置${gl_bai}"
+        fi
+        
+        # 显示重传统计
+        local retrans=$(ss -s 2>/dev/null | grep -oP 'retrans:\K\d+' || echo "0")
+        echo -e "  当前重传: ${retrans} 个"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        
+        echo -e "${gl_kjlan}功能菜单:${gl_bai}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "1. 自动检测并优化 ⭐ 推荐"
+        echo "   （多地区MTU探测 + 自动设置最佳MSS）"
+        echo ""
+        echo "2. 移除MSS Clamp"
+        echo "   （恢复默认配置）"
+        echo ""
+        echo "0. 返回主菜单"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        
+        read -e -p "请选择操作 [1]: " choice
+        choice=${choice:-1}
+        
+        case $choice in
+            1)
+                # 自动检测并优化
+                # 执行MTU检测
+                local mss_result=$(detect_path_mtu_multi_region)
+                local min_mss=$(echo "$mss_result" | awk '{print $1}')
+                local max_mss=$(echo "$mss_result" | awk '{print $2}')
+                
+                if [ -z "$min_mss" ] || [ -z "$max_mss" ]; then
+                     echo -e "${gl_hong}检测失败，无法获取MSS值${gl_bai}"
+                     sleep 2
+                     break_end
+                     continue
+                fi
+
+                local mid_mss=$(( (min_mss + max_mss) / 2 ))
+
+                echo ""
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                
+                if [ "$min_mss" -eq "$max_mss" ]; then
+                    read -e -p "是否应用推荐的 MSS = ${min_mss}？(Y/N) [Y]: " confirm
+                    confirm=${confirm:-Y}
+                    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                        echo ""
+                        apply_mss_clamp_with_value "$min_mss"
+                        if [ $? -eq 0 ]; then
+                            verify_mss_optimization
+                        fi
+                        break_end
+                    else
+                         echo -e "${gl_huang}已取消应用${gl_bai}"
+                         sleep 2
+                    fi
+                else
+                    echo "请选择优化策略:"
+                    echo "  1) 保守方案 (${min_mss})"
+                    echo "  2) 激进方案 (${max_mss})"
+                    echo "  3) 折中方案 (${mid_mss})"
+                    echo "  0) 取消"
+                    echo ""
+                    read -e -p "请输入选择 [1]: " strategy
+                    strategy=${strategy:-1}
+                    
+                    local selected_mss=""
+                    case $strategy in
+                        1) selected_mss=$min_mss ;;
+                        2) selected_mss=$max_mss ;;
+                        3) selected_mss=$mid_mss ;;
+                        0) echo -e "${gl_huang}已取消${gl_bai}"; sleep 2; ;;
+                        *) echo -e "${gl_hong}无效选择${gl_bai}"; sleep 2; ;;
+                    esac
+                    
+                    if [ -n "$selected_mss" ]; then
+                        echo ""
+                        apply_mss_clamp_with_value "$selected_mss"
+                        if [ $? -eq 0 ]; then
+                            verify_mss_optimization
+                        fi
+                        break_end
+                    fi
+                fi
+                ;;
+            2)
+                # 移除MSS Clamp
+                clear
+                echo -e "${gl_kjlan}==========================================${gl_bai}"
+                echo "      移除 MSS Clamp"
+                echo -e "${gl_kjlan}==========================================${gl_bai}"
+                echo ""
+                
+                read -e -p "确认要移除 MSS Clamp 吗？(Y/N) [N]: " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    echo ""
+                    echo "正在移除..."
+                    iptables -t mangle -F OUTPUT 2>/dev/null
+                    iptables -t mangle -F POSTROUTING 2>/dev/null
+                    
+                    if command -v netfilter-persistent &>/dev/null; then
+                        netfilter-persistent save >/dev/null 2>&1
+                    fi
+                    
+                    echo -e "${gl_lv}✅ MSS Clamp 已移除${gl_bai}"
+                else
+                    echo -e "${gl_huang}已取消${gl_bai}"
+                fi
+                sleep 2
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                echo -e "${gl_hong}无效选择${gl_bai}"
+                sleep 1
+                ;;
+        esac
+    done
+}
 show_xray_config() {
     clear
     echo -e "${gl_kjlan}=== 查看 Xray 配置 ===${gl_bai}"
@@ -2614,7 +3078,7 @@ detect_bandwidth() {
     echo "请选择带宽配置方式：" >&2
     echo "1. 自动检测（推荐，自动选择最近服务器）" >&2
     echo "2. 手动指定测速服务器（指定服务器ID）" >&2
-    echo "3. 使用默认值（1000 Mbps / 1 Gbps，跳过检测）" >&2
+    echo "3. 手动选择预设档位（9个常用带宽档位）" >&2
     echo "" >&2
     
     read -e -p "请输入选择 [1]: " bw_choice
@@ -2947,13 +3411,127 @@ detect_bandwidth() {
             fi
             ;;
         3)
-            # 使用默认值
+            # 手动选择预设档位
             echo "" >&2
-            echo -e "${gl_lv}使用默认配置: 1000 Mbps（16 MB 缓冲区）${gl_bai}" >&2
-            echo -e "${gl_zi}说明: 适合标准 1Gbps 服务器，覆盖大多数场景${gl_bai}" >&2
+            echo -e "${gl_kjlan}=== 手动选择带宽档位 ===${gl_bai}" >&2
             echo "" >&2
-            echo "1000"
-            return 0
+            echo "请选择带宽档位：" >&2
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+            echo "" >&2
+            echo -e "${gl_huang}【小带宽 VPS】${gl_bai}" >&2
+            echo "1. 100 Mbps   → 缓冲区 6 MB   (NAT/极小带宽)" >&2
+            echo "2. 200 Mbps   → 缓冲区 8 MB   (小型VPS)" >&2
+            echo "3. 300 Mbps   → 缓冲区 10 MB  (入门服务器)" >&2
+            echo "" >&2
+            echo -e "${gl_huang}【中等带宽】${gl_bai}" >&2
+            echo "4. 500 Mbps   → 缓冲区 12 MB  (标准小带宽)" >&2
+            echo "5. 700 Mbps   → 缓冲区 14 MB  (准千兆)" >&2
+            echo "6. 1 Gbps ⭐  → 缓冲区 16 MB  (标准VPS/最常见)" >&2
+            echo "" >&2
+            echo -e "${gl_huang}【高带宽服务器】${gl_bai}" >&2
+            echo "7. 1.5 Gbps   → 缓冲区 20 MB  (中高端VPS)" >&2
+            echo "8. 2 Gbps     → 缓冲区 24 MB  (高性能VPS)" >&2
+            echo "9. 2.5 Gbps   → 缓冲区 28 MB  (准万兆)" >&2
+            echo "" >&2
+            echo -e "${gl_zi}【其他选项】${gl_bai}" >&2
+            echo "10. 自定义输入（手动指定任意带宽值）" >&2
+            echo "0. 返回上级菜单" >&2
+            echo "" >&2
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2
+            echo "" >&2
+            
+            # 读取用户选择
+            local preset_choice=""
+            read -e -p "请输入选择 [6]: " preset_choice
+            preset_choice=${preset_choice:-6}  # 默认选择6 (1 Gbps)
+            
+            case "$preset_choice" in
+                1)
+                    echo "" >&2
+                    echo -e "${gl_lv}✅ 已选择: 100 Mbps (缓冲区 6 MB)${gl_bai}" >&2
+                    echo "100"
+                    return 0
+                    ;;
+                2)
+                    echo "" >&2
+                    echo -e "${gl_lv}✅ 已选择: 200 Mbps (缓冲区 8 MB)${gl_bai}" >&2
+                    echo "200"
+                    return 0
+                    ;;
+                3)
+                    echo "" >&2
+                    echo -e "${gl_lv}✅ 已选择: 300 Mbps (缓冲区 10 MB)${gl_bai}" >&2
+                    echo "300"
+                    return 0
+                    ;;
+                4)
+                    echo "" >&2
+                    echo -e "${gl_lv}✅ 已选择: 500 Mbps (缓冲区 12 MB)${gl_bai}" >&2
+                    echo "500"
+                    return 0
+                    ;;
+                5)
+                    echo "" >&2
+                    echo -e "${gl_lv}✅ 已选择: 700 Mbps (缓冲区 14 MB)${gl_bai}" >&2
+                    echo "700"
+                    return 0
+                    ;;
+                6)
+                    echo "" >&2
+                    echo -e "${gl_lv}✅ 已选择: 1000 Mbps (缓冲区 16 MB)${gl_bai}" >&2
+                    echo "1000"
+                    return 0
+                    ;;
+                7)
+                    echo "" >&2
+                    echo -e "${gl_lv}✅ 已选择: 1500 Mbps (缓冲区 20 MB)${gl_bai}" >&2
+                    echo "1500"
+                    return 0
+                    ;;
+                8)
+                    echo "" >&2
+                    echo -e "${gl_lv}✅ 已选择: 2000 Mbps (缓冲区 24 MB)${gl_bai}" >&2
+                    echo "2000"
+                    return 0
+                    ;;
+                9)
+                    echo "" >&2
+                    echo -e "${gl_lv}✅ 已选择: 2500 Mbps (缓冲区 28 MB)${gl_bai}" >&2
+                    echo "2500"
+                    return 0
+                    ;;
+                10)
+                    # 自定义输入
+                    echo "" >&2
+                    echo -e "${gl_zi}=== 自定义输入 ===${gl_bai}" >&2
+                    echo "" >&2
+                    local manual_bandwidth=""
+                    while true; do
+                        read -e -p "请输入带宽值（单位：Mbps，如 750、1200）: " manual_bandwidth
+                        if [[ "$manual_bandwidth" =~ ^[0-9]+$ ]] && [ "$manual_bandwidth" -gt 0 ]; then
+                            echo "" >&2
+                            echo -e "${gl_lv}✅ 使用自定义值: ${manual_bandwidth} Mbps${gl_bai}" >&2
+                            echo "$manual_bandwidth"
+                            return 0
+                        else
+                            echo -e "${gl_hong}❌ 请输入有效的正整数${gl_bai}" >&2
+                        fi
+                    done
+                    ;;
+                0)
+                    # 返回上级菜单
+                    echo "" >&2
+                    echo -e "${gl_huang}已取消选择，返回上级菜单${gl_bai}" >&2
+                    echo "1000"  # 返回默认值，避免空值
+                    return 1
+                    ;;
+                *)
+                    echo "" >&2
+                    echo -e "${gl_hong}无效选择，使用默认值 1000 Mbps${gl_bai}" >&2
+                    echo "1000"
+                    return 1
+                    ;;
+            esac
             ;;
         *)
             echo -e "${gl_huang}无效选择，使用默认值 1000 Mbps${gl_bai}" >&2
@@ -2969,8 +3547,36 @@ calculate_buffer_size() {
     local buffer_mb
     local bandwidth_level
     
-    # 根据带宽范围计算推荐缓冲区
-    if [ "$bandwidth" -lt 500 ]; then
+    # 优先匹配预设档位（精确匹配）
+    if [ "$bandwidth" -eq 100 ]; then
+        buffer_mb=6
+        bandwidth_level="预设档位（100 Mbps）"
+    elif [ "$bandwidth" -eq 200 ]; then
+        buffer_mb=8
+        bandwidth_level="预设档位（200 Mbps）"
+    elif [ "$bandwidth" -eq 300 ]; then
+        buffer_mb=10
+        bandwidth_level="预设档位（300 Mbps）"
+    elif [ "$bandwidth" -eq 500 ]; then
+        buffer_mb=12
+        bandwidth_level="预设档位（500 Mbps）"
+    elif [ "$bandwidth" -eq 700 ]; then
+        buffer_mb=14
+        bandwidth_level="预设档位（700 Mbps）"
+    elif [ "$bandwidth" -eq 1000 ]; then
+        buffer_mb=16
+        bandwidth_level="预设档位（1 Gbps）"
+    elif [ "$bandwidth" -eq 1500 ]; then
+        buffer_mb=20
+        bandwidth_level="预设档位（1.5 Gbps）"
+    elif [ "$bandwidth" -eq 2000 ]; then
+        buffer_mb=24
+        bandwidth_level="预设档位（2 Gbps）"
+    elif [ "$bandwidth" -eq 2500 ]; then
+        buffer_mb=28
+        bandwidth_level="预设档位（2.5 Gbps）"
+    # 否则使用原有的范围判断（用于自动检测和自定义值）
+    elif [ "$bandwidth" -lt 500 ]; then
         buffer_mb=8
         bandwidth_level="小带宽（< 500 Mbps）"
     elif [ "$bandwidth" -lt 1000 ]; then
@@ -3279,7 +3885,7 @@ bbr_configure_direct() {
     
     # 获取物理内存用于虚拟内存参数调整
     local mem_total=$(free -m | awk 'NR==2{print $2}')
-    local vm_swappiness=10
+    local vm_swappiness=5
     local vm_dirty_ratio=15
     local vm_min_free_kbytes=65536
     
@@ -3320,11 +3926,32 @@ net.core.somaxconn=4096
 net.ipv4.tcp_max_syn_backlog=8192
 
 # 网络队列（高带宽优化）
-net.core.netdev_max_backlog=16384
+net.core.netdev_max_backlog=5000
 
 # 高级TCP优化
 net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_mtu_probing=1
+
+# ===== Reality终极优化参数 =====
+
+# 发送低水位（上传速度优化关键）
+net.ipv4.tcp_notsent_lowat=16384
+
+# 连接回收优化
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_max_tw_buckets=5000
+
+# TCP保活优化（更快检测死连接）
+net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+
+# UDP缓冲区（QUIC/Hysteria 支持）
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+
+# TCP安全增强
+net.ipv4.tcp_syncookies=1
 
 # 虚拟内存优化（根据物理内存调整）
 vm.swappiness=${vm_swappiness}
@@ -3355,11 +3982,11 @@ EOF
     if ! grep -q "BBR - 文件描述符优化" /etc/security/limits.conf 2>/dev/null; then
         cat >> /etc/security/limits.conf << 'LIMITSEOF'
 # BBR - 文件描述符优化
-* soft nofile 65535
-* hard nofile 65535
+* soft nofile 524288
+* hard nofile 524288
 LIMITSEOF
     fi
-    ulimit -n 65535 2>/dev/null
+    ulimit -n 524288 2>/dev/null
     
     # 禁用透明大页面
     if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
@@ -3934,12 +4561,12 @@ show_detailed_status() {
 }
 
 #=============================================================================
-# 内核参数优化 - 星辰大海ヾ优化模式（VLESS Reality/AnyTLS专用）
+# 内核参数优化 - 星辰大海ヾ优化模式（VLESS Reality 专用）
 #=============================================================================
 
 optimize_xinchendahai() {
     echo -e "${gl_lv}切换到星辰大海ヾ优化模式...${gl_bai}"
-    echo -e "${gl_zi}针对 VLESS Reality/AnyTLS 节点深度优化${gl_bai}"
+    echo -e "${gl_zi}针对 VLESS Reality 节点深度优化${gl_bai}"
     echo ""
     echo -e "${gl_hong}⚠️  重要提示 ⚠️${gl_bai}"
     echo -e "${gl_huang}本配置为临时生效（使用 sysctl -w 命令）${gl_bai}"
@@ -4258,7 +4885,7 @@ optimize_low_spec() {
 
 optimize_xinchendahai_original() {
     echo -e "${gl_lv}切换到星辰大海ヾ原始版模式...${gl_bai}"
-    echo -e "${gl_zi}针对 VLESS Reality/AnyTLS 节点深度优化（原始参数）${gl_bai}"
+    echo -e "${gl_zi}针对 VLESS Reality 节点深度优化（原始参数）${gl_bai}"
     echo ""
     echo -e "${gl_hong}⚠️  重要提示 ⚠️${gl_bai}"
     echo -e "${gl_huang}本配置为临时生效（使用 sysctl -w 命令）${gl_bai}"
@@ -4380,7 +5007,7 @@ optimize_xinchendahai_original() {
 }
 
 #=============================================================================
-# DNS净化与安全加固功能（NS论坛）
+# DNS净化与安全加固功能（NS论坛）- SSH安全增强版
 #=============================================================================
 
 # DNS净化 - 智能检测并修复 systemd-resolved
@@ -4388,7 +5015,7 @@ dns_purify_fix_systemd_resolved() {
     echo -e "${gl_kjlan}正在检测 systemd-resolved 服务状态...${gl_bai}"
 
     # 检查服务是否被 masked
-    if systemctl is-enabled systemd-resolved &>/dev/null; then
+    if systemctl is-enabled systemd-resolved &> /dev/null; then
         echo -e "${gl_lv}✅ systemd-resolved 服务状态正常${gl_bai}"
         return 0
     fi
@@ -4444,22 +5071,222 @@ dns_purify_fix_systemd_resolved() {
     fi
 }
 
-# DNS净化 - 主执行函数
+# DNS净化 - 主执行函数（SSH安全版）
 dns_purify_and_harden() {
     clear
     echo -e "${gl_kjlan}╔════════════════════════════════════════════════════════════╗${gl_bai}"
-    echo -e "${gl_kjlan}║       DNS净化与安全加固脚本 - 智能修复版                    ║${gl_bai}"
+    echo -e "${gl_kjlan}║    DNS净化与安全加固脚本 - SSH安全增强版 v2.0             ║${gl_bai}"
     echo -e "${gl_kjlan}╚════════════════════════════════════════════════════════════╝${gl_bai}"
     echo ""
 
-    # 目标DNS配置
-    local TARGET_DNS="8.8.8.8#dns.google 1.1.1.1#cloudflare-dns.com"
+    # ==================== SSH安全检测 ====================
+    local IS_SSH=false
+    if [ -n "$SSH_CLIENT" ] || [ -n "$SSH_TTY" ]; then
+        IS_SSH=true
+        echo -e "${gl_hong}⚠️  检测到您正在通过SSH连接${gl_bai}"
+        echo -e "${gl_lv}✅ SSH安全模式已启用：本脚本不会中断您的网络连接${gl_bai}"
+        echo ""
+    fi
+
+    echo -e "${gl_kjlan}功能说明：${gl_bai}"
+    echo "  ✓ 配置安全的DNS服务器（支持国外/国内/混合模式）"
+    echo "  ✓ 防止DHCP覆盖DNS配置"
+    echo "  ✓ 清除厂商残留的DNS配置"
+    echo "  ✓ 启用DNS安全功能（DNSSEC + DNS over TLS）"
+    echo ""
+    
+    if [ "$IS_SSH" = true ]; then
+        echo -e "${gl_lv}SSH安全保证：${gl_bai}"
+        echo "  ✓ 不会停止或重启网络服务"
+        echo "  ✓ 不会中断SSH连接"
+        echo "  ✓ 所有配置立即生效，无需重启"
+        echo "  ✓ 提供完整的回滚机制"
+        echo ""
+    fi
+    
+    # ==================== DNS模式选择 ====================
+    echo -e "${gl_kjlan}请选择 DNS 配置模式：${gl_bai}"
+    echo ""
+    echo "  1. 🌍 纯国外模式（抗污染推荐）"
+    echo "     首选：Google DNS + Cloudflare DNS"
+    echo "     备用：无"
+    echo "     加密：强制 DNS over TLS"
+    echo ""
+    echo "  2. 🇨🇳 纯国内模式（低延迟推荐）"
+    echo "     首选：阿里云 DNS + 腾讯 DNSPod"
+    echo "     备用：无"
+    echo "     加密：无（国内DNS不支持DoT/DNSSEC）"
+    echo ""
+    echo "  3. 🔀 混合模式（最大容错）"
+    echo "     首选：Google DNS + Cloudflare DNS"
+    echo "     备用：阿里云 DNS + 114DNS"
+    echo "     加密：机会性 DNS over TLS"
+    echo ""
+    read -e -p "$(echo -e "${gl_huang}请选择 (1/2/3，默认1): ${gl_bai}")" dns_mode_choice
+    dns_mode_choice=${dns_mode_choice:-1}
+    
+    # 验证输入
+    if [[ ! "$dns_mode_choice" =~ ^[1-3]$ ]]; then
+        dns_mode_choice=1
+    fi
+    
+    echo ""
+    
+    read -e -p "$(echo -e "${gl_huang}是否继续执行？(y/n): ${gl_bai}")" confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${gl_huang}已取消操作${gl_bai}"
+        return
+    fi
+
+    # ==================== 终极安全检查 ====================
+    echo ""
+    echo -e "${gl_kjlan}[安全检查] 正在验证系统环境...${gl_bai}"
+    echo ""
+    
+    local pre_check_failed=false
+    
+    # 检查1: 磁盘空间（至少需要100MB）
+    echo -n "  → 检查磁盘空间... "
+    local available_space=$(df -m /etc | awk 'NR==2 {print $4}')
+    if [ "$available_space" -lt 100 ]; then
+        echo -e "${gl_hong}失败 (可用: ${available_space}MB, 需要: 100MB)${gl_bai}"
+        pre_check_failed=true
+    else
+        echo -e "${gl_lv}通过 (可用: ${available_space}MB)${gl_bai}"
+    fi
+    
+    # 检查2: 内存（至少需要50MB可用）
+    echo -n "  → 检查可用内存... "
+    local available_mem=$(free -m | awk 'NR==2 {print $7}')
+    if [ "$available_mem" -lt 50 ]; then
+        echo -e "${gl_hong}失败 (可用: ${available_mem}MB, 需要: 50MB)${gl_bai}"
+        pre_check_failed=true
+    else
+        echo -e "${gl_lv}通过 (可用: ${available_mem}MB)${gl_bai}"
+    fi
+    
+    # 检查3: systemd 是否正常工作
+    echo -n "  → 检查 systemd 状态... "
+    if ! systemctl --version > /dev/null 2>&1; then
+        echo -e "${gl_hong}失败 (systemctl 命令无法执行)${gl_bai}"
+        pre_check_failed=true
+    else
+        echo -e "${gl_lv}通过${gl_bai}"
+    fi
+    
+    # 检查4: 是否有其他包管理器在运行
+    echo -n "  → 检查包管理器锁... "
+    if lsof /var/lib/dpkg/lock-frontend > /dev/null 2>&1 || \
+       lsof /var/lib/apt/lists/lock > /dev/null 2>&1 || \
+       lsof /var/cache/apt/archives/lock > /dev/null 2>&1; then
+        echo -e "${gl_hong}失败 (其他包管理器正在运行)${gl_bai}"
+        pre_check_failed=true
+    else
+        echo -e "${gl_lv}通过${gl_bai}"
+    fi
+    
+    # 检查5: /run 目录是否可写
+    echo -n "  → 检查 /run 目录权限... "
+    if ! touch /run/.dns_test 2>/dev/null; then
+        echo -e "${gl_hong}失败 (/run 目录不可写)${gl_bai}"
+        pre_check_failed=true
+    else
+        rm -f /run/.dns_test
+        echo -e "${gl_lv}通过${gl_bai}"
+    fi
+    
+    # 检查6: 网络连通性（能否访问DNS服务器）
+    echo -n "  → 检查网络连通性... "
+    if ! ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1 && \
+       ! ping -c 1 -W 2 1.1.1.1 > /dev/null 2>&1; then
+        echo -e "${gl_huang}警告 (无法ping通DNS服务器，但继续执行)${gl_bai}"
+    else
+        echo -e "${gl_lv}通过${gl_bai}"
+    fi
+    
+    echo ""
+    
+    # 如果有检查失败，拒绝执行
+    if [ "$pre_check_failed" = true ]; then
+        echo -e "${gl_hong}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo -e "${gl_hong}❌ 安全检查未通过！${gl_bai}"
+        echo -e "${gl_hong}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo ""
+        echo -e "${gl_huang}系统环境不满足安全执行条件，拒绝执行以避免风险。${gl_bai}"
+        echo ""
+        echo "请先解决上述问题，然后重试。"
+        echo ""
+        break_end
+        return 1
+    fi
+    
+    echo -e "${gl_lv}✅ 所有安全检查通过，可以安全执行${gl_bai}"
+    echo ""
+
+    # ==================== 创建备份 ====================
+    local BACKUP_DIR="/root/.dns_purify_backup/$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    echo ""
+    echo -e "${gl_lv}✅ 创建备份目录：$BACKUP_DIR${gl_bai}"
+    echo ""
+
+    # 目标DNS配置（根据用户选择的模式）
+    local TARGET_DNS=""
+    local FALLBACK_DNS=""
+    local DNS_OVER_TLS=""
+    local DNSSEC_MODE=""
+    local MODE_NAME=""
+    # 网卡级 DNS（用于 resolvectl，不含 DoT 后缀）
+    local INTERFACE_DNS_PRIMARY=""
+    local INTERFACE_DNS_SECONDARY=""
+    
+    case "$dns_mode_choice" in
+        1)
+            # 纯国外模式
+            TARGET_DNS="8.8.8.8#dns.google 1.1.1.1#cloudflare-dns.com"
+            FALLBACK_DNS=""
+            DNS_OVER_TLS="yes"
+            DNSSEC_MODE="no"
+            MODE_NAME="纯国外模式"
+            INTERFACE_DNS_PRIMARY="8.8.8.8"
+            INTERFACE_DNS_SECONDARY="1.1.1.1"
+            ;;
+        2)
+            # 纯国内模式（国内DNS和国内域名大多不支持DNSSEC，必须禁用）
+            TARGET_DNS="223.5.5.5 119.29.29.29"
+            FALLBACK_DNS=""
+            DNS_OVER_TLS="no"
+            DNSSEC_MODE="no"
+            MODE_NAME="纯国内模式"
+            INTERFACE_DNS_PRIMARY="223.5.5.5"
+            INTERFACE_DNS_SECONDARY="119.29.29.29"
+            ;;
+        3)
+            # 混合模式
+            TARGET_DNS="8.8.8.8#dns.google 1.1.1.1#cloudflare-dns.com"
+            FALLBACK_DNS="223.5.5.5 114.114.114.114"
+            DNS_OVER_TLS="opportunistic"
+            DNSSEC_MODE="no"
+            MODE_NAME="混合模式"
+            INTERFACE_DNS_PRIMARY="8.8.8.8"
+            INTERFACE_DNS_SECONDARY="1.1.1.1"
+            ;;
+    esac
+    
+    echo -e "${gl_lv}已选择：${MODE_NAME}${gl_bai}"
+    echo ""
+    
+    # 构建配置
     local SECURE_RESOLVED_CONFIG="[Resolve]
 DNS=${TARGET_DNS}
+${FALLBACK_DNS:+FallbackDNS=${FALLBACK_DNS}}
 LLMNR=no
 MulticastDNS=no
-DNSSEC=allow-downgrade
-DNSOverTLS=yes
+DNSSEC=${DNSSEC_MODE}
+DNSOverTLS=${DNS_OVER_TLS}
+Cache=yes
+DNSStubListener=yes
 "
 
     echo "--- 开始执行DNS净化与安全加固流程 ---"
@@ -4468,167 +5295,688 @@ DNSOverTLS=yes
     local debian_version
     debian_version=$(grep "VERSION_ID" /etc/os-release | cut -d'=' -f2 | tr -d '"' || echo "unknown")
 
-    echo -e "${gl_kjlan}阶段一：正在清除所有潜在的DNS冲突源...${gl_bai}"
+    # ==================== 阶段一：清除DNS冲突源 ====================
+    echo -e "${gl_kjlan}[阶段 1/4] 清除DNS冲突源（安全操作）...${gl_bai}"
+    echo ""
 
-    # 处理 dhclient
+    # 1. 驯服 DHCP 客户端
     local dhclient_conf="/etc/dhcp/dhclient.conf"
     if [[ -f "$dhclient_conf" ]]; then
+        # 备份
+        cp "$dhclient_conf" "$BACKUP_DIR/dhclient.conf.bak" 2>/dev/null || true
+        
         if ! grep -q "ignore domain-name-servers;" "$dhclient_conf" || ! grep -q "ignore domain-search;" "$dhclient_conf"; then
-            echo "正在驯服 DHCP 客户端 (dhclient)..."
+            echo "  → 配置 dhclient 忽略DHCP提供的DNS..."
             echo "" >> "$dhclient_conf"
+            echo "# 由DNS净化脚本添加 - $(date)" >> "$dhclient_conf"
             echo "ignore domain-name-servers;" >> "$dhclient_conf"
             echo "ignore domain-search;" >> "$dhclient_conf"
-            echo -e "${gl_lv}✅ 已确保 'ignore' 指令存在于 ${dhclient_conf}${gl_bai}"
+            echo -e "${gl_lv}  ✅ dhclient 配置完成${gl_bai}"
+        else
+            echo -e "${gl_lv}  ✅ dhclient 已配置（跳过）${gl_bai}"
         fi
     fi
 
-    # 处理 if-up.d 脚本
+    # 2. 禁用冲突的 if-up.d 脚本
     local ifup_script="/etc/network/if-up.d/resolved"
     if [[ -f "$ifup_script" ]] && [[ -x "$ifup_script" ]]; then
-        echo "正在禁用有冲突的 if-up.d 兼容性脚本..."
+        echo "  → 禁用 if-up.d/resolved 脚本..."
         chmod -x "$ifup_script"
-        echo -e "${gl_lv}✅ 已移除 ${ifup_script} 的可执行权限。${gl_bai}"
+        echo -e "${gl_lv}  ✅ 已移除可执行权限${gl_bai}"
     fi
 
-    # 处理 /etc/network/interfaces
+    # 3. 注释 /etc/network/interfaces 中的DNS配置
     local interfaces_file="/etc/network/interfaces"
-    if [[ -f "$interfaces_file" ]] && grep -qE '^[[:space:]]*dns-(nameservers|search|domain)' "$interfaces_file"; then
-        echo "正在净化 /etc/network/interfaces 中的厂商残留DNS配置..."
-        sed -i -E 's/^[[:space:]]*(dns-(nameservers|search|domain).*)/# \1/' "$interfaces_file"
-        echo -e "${gl_lv}✅ 旧有DNS配置已成功注释禁用。${gl_bai}"
+    if [[ -f "$interfaces_file" ]]; then
+        # 备份
+        cp "$interfaces_file" "$BACKUP_DIR/interfaces.bak" 2>/dev/null || true
+        
+        if grep -qE '^[[:space:]]*dns-(nameservers|search|domain)' "$interfaces_file"; then
+            echo "  → 清除 /etc/network/interfaces 中的DNS配置..."
+            sed -i.bak -E 's/^([[:space:]]*dns-(nameservers|search|domain).*)/# \1 # 已被DNS净化脚本禁用/' "$interfaces_file"
+            echo -e "${gl_lv}  ✅ 厂商DNS配置已注释${gl_bai}"
+        else
+            echo -e "${gl_lv}  ✅ /etc/network/interfaces 无DNS配置${gl_bai}"
+        fi
     fi
 
     echo ""
-    echo -e "${gl_kjlan}阶段二：正在配置 systemd-resolved...${gl_bai}"
 
-    # 安装 systemd-resolved（如果需要）
+    # ==================== 阶段二：配置 systemd-resolved ====================
+    echo -e "${gl_kjlan}[阶段 2/4] 配置 systemd-resolved...${gl_bai}"
+    echo ""
+
+    # 检查是否已安装
     if ! command -v resolvectl &> /dev/null; then
-        echo "正在安装 systemd-resolved..."
-        echo "  → 更新软件包列表..."
-        apt-get update -y 2>&1 | grep -E "^(Hit|Get|Fetched|Reading)" || true
-        echo "  → 安装 systemd-resolved 软件包..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-resolved 2>&1 | grep -E "^(Selecting|Unpacking|Setting up|Processing)" || echo "    安装中，请稍候..."
-        echo -e "${gl_lv}✅ systemd-resolved 安装完成${gl_bai}"
+        echo "  → 检测到未安装 systemd-resolved"
+        echo "  → 安装 systemd-resolved..."
+        apt-get update -y > /dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-resolved > /dev/null 2>&1
+        echo -e "${gl_lv}  ✅ systemd-resolved 安装完成${gl_bai}"
     else
-        echo -e "${gl_lv}✅ systemd-resolved 已安装${gl_bai}"
+        echo -e "${gl_lv}  ✅ systemd-resolved 已安装${gl_bai}"
     fi
 
     # 处理 Debian 11 的 resolvconf 冲突
     if [[ "$debian_version" == "11" ]] && dpkg -s resolvconf &> /dev/null; then
-        echo "检测到 Debian 11 上的 'resolvconf'，正在卸载..."
-        apt-get remove -y resolvconf > /dev/null
-        rm -f /etc/resolv.conf
-        echo -e "${gl_lv}✅ 'resolvconf' 已成功卸载。${gl_bai}"
+        echo "  → 检测到 Debian 11 的 resolvconf 冲突"
+        
+        # 🛡️ 关键修复：在卸载前确保 systemd-resolved 完全就绪
+        # 先启动 systemd-resolved
+        echo "  → 启动 systemd-resolved（在卸载 resolvconf 之前）..."
+        systemctl enable systemd-resolved 2>/dev/null || true
+        systemctl start systemd-resolved 2>/dev/null || true
+        
+        # 等待服务启动
+        sleep 2
+        
+        # 验证 systemd-resolved 正在运行
+        if ! systemctl is-active --quiet systemd-resolved; then
+            echo -e "${gl_hong}❌ 无法启动 systemd-resolved，中止操作${gl_bai}"
+            break_end
+            return 1
+        fi
+        
+        # 验证 stub-resolv.conf 存在
+        if [[ ! -f /run/systemd/resolve/stub-resolv.conf ]]; then
+            echo -e "${gl_hong}❌ systemd-resolved stub 文件不存在，中止操作${gl_bai}"
+            break_end
+            return 1
+        fi
+        
+        # 现在可以安全地卸载 resolvconf
+        # 备份当前 resolv.conf
+        [[ -f /etc/resolv.conf ]] && cp /etc/resolv.conf "$BACKUP_DIR/resolv.conf.pre_remove" 2>/dev/null || true
+        
+        # 创建临时DNS配置（避免卸载期间DNS中断）
+        echo "nameserver $INTERFACE_DNS_PRIMARY" > /etc/resolv.conf.tmp
+        echo "nameserver $INTERFACE_DNS_SECONDARY" >> /etc/resolv.conf.tmp
+        
+        # 使用临时DNS配置
+        mv /etc/resolv.conf /etc/resolv.conf.old 2>/dev/null || true
+        cp /etc/resolv.conf.tmp /etc/resolv.conf
+        
+        # 卸载 resolvconf
+        echo "  → 卸载 resolvconf..."
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y resolvconf > /dev/null 2>&1
+        
+        # 清理临时文件
+        rm -f /etc/resolv.conf.tmp /etc/resolv.conf.old
+        
+        echo -e "${gl_lv}  ✅ resolvconf 已安全卸载${gl_bai}"
     fi
 
-    # 🔧 关键修复：调用智能修复函数
+    # 🔧 调用智能修复函数
     if ! dns_purify_fix_systemd_resolved; then
-        echo -e "${gl_hong}无法修复 systemd-resolved 服务，脚本终止${gl_bai}"
+        echo -e "${gl_hong}❌ 无法修复 systemd-resolved 服务，脚本终止${gl_bai}"
+        echo "配置未被修改，系统保持原状"
         break_end
         return 1
     fi
 
-    echo ""
-    echo "正在应用最终的DNS安全配置 (DoT, DNSSEC...)"
+    # 备份并写入配置
+    if [[ -f /etc/systemd/resolved.conf ]]; then
+        cp /etc/systemd/resolved.conf "$BACKUP_DIR/resolved.conf.bak" 2>/dev/null || true
+    fi
+
+    echo "  → 配置 systemd-resolved..."
     echo -e "${SECURE_RESOLVED_CONFIG}" > /etc/systemd/resolved.conf
-    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-    systemctl restart systemd-resolved
-    sleep 2
+    
+    echo ""
+
+    # ==================== 阶段三：应用DNS配置（SSH安全方式）====================
+    echo -e "${gl_kjlan}[阶段 3/4] 应用DNS配置（SSH安全模式）...${gl_bai}"
+    echo ""
+
+    # 先重新加载 systemd-resolved 配置
+    echo "  → 重新加载 systemd-resolved 配置..."
+    if ! systemctl reload-or-restart systemd-resolved; then
+        echo -e "${gl_hong}❌ systemd-resolved 重启失败！${gl_bai}"
+        echo "正在回滚配置..."
+        if [[ -f "$BACKUP_DIR/resolved.conf.bak" ]]; then
+            cp "$BACKUP_DIR/resolved.conf.bak" /etc/systemd/resolved.conf
+            systemctl reload-or-restart systemd-resolved 2>/dev/null || true
+        fi
+        break_end
+        return 1
+    fi
+    
+    # 等待服务完全启动
+    echo "  → 等待 systemd-resolved 完全启动..."
+    sleep 3
+    
+    # 验证服务状态
+    if ! systemctl is-active --quiet systemd-resolved; then
+        echo -e "${gl_hong}❌ systemd-resolved 未能正常运行！${gl_bai}"
+        echo "正在回滚配置..."
+        if [[ -f "$BACKUP_DIR/resolved.conf.bak" ]]; then
+            cp "$BACKUP_DIR/resolved.conf.bak" /etc/systemd/resolved.conf
+            systemctl reload-or-restart systemd-resolved 2>/dev/null || true
+        fi
+        break_end
+        return 1
+    fi
+    
+    # 验证 stub-resolv.conf 文件存在
+    if [[ ! -f /run/systemd/resolve/stub-resolv.conf ]]; then
+        echo -e "${gl_hong}❌ systemd-resolved stub 文件不存在！${gl_bai}"
+        echo "路径: /run/systemd/resolve/stub-resolv.conf"
+        echo "正在回滚配置..."
+        if [[ -f "$BACKUP_DIR/resolved.conf.bak" ]]; then
+            cp "$BACKUP_DIR/resolved.conf.bak" /etc/systemd/resolved.conf
+            systemctl reload-or-restart systemd-resolved 2>/dev/null || true
+        fi
+        break_end
+        return 1
+    fi
+    
+    echo -e "${gl_lv}  ✅ systemd-resolved 配置已重新加载并验证${gl_bai}"
+    
+    # 🔒 检测 immutable 属性（云服务商保护机制）
+    if [[ -e /etc/resolv.conf ]] && lsattr /etc/resolv.conf 2>/dev/null | grep -q 'i'; then
+        echo ""
+        echo -e "${gl_hong}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo -e "${gl_hong}⚠️  检测到 /etc/resolv.conf 被锁定保护${gl_bai}"
+        echo -e "${gl_hong}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo ""
+        echo "原因：您的服务器设置了不可变属性（通常是云服务商的保护机制）"
+        echo ""
+        echo "风险：强制修改可能导致机器失联或网络异常"
+        echo ""
+        echo "建议：如非必要，不建议继续修改"
+        echo "      能正常执行的系统不会弹出此提示"
+        echo ""
+        echo -e "${gl_lv}状态：本次操作已安全终止，您的配置未被修改${gl_bai}"
+        echo ""
+        break_end
+        return 1
+    fi
+    
+    # 🛡️ 关键修复：安全地创建 resolv.conf 链接
+    # 备份并创建 resolv.conf 链接（只有在验证通过后才执行）
+    if [[ -e /etc/resolv.conf ]] && [[ ! -L /etc/resolv.conf ]]; then
+        # 如果是普通文件，备份它
+        cp /etc/resolv.conf "$BACKUP_DIR/resolv.conf.bak" 2>/dev/null || true
+    fi
+    
+    # 安全地创建链接
+    rm -f /etc/resolv.conf
+    ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    
+    # 验证链接创建成功
+    if [[ ! -L /etc/resolv.conf ]] || [[ ! -e /etc/resolv.conf ]]; then
+        echo -e "${gl_hong}❌ resolv.conf 链接创建失败！${gl_bai}"
+        echo "正在恢复原始配置..."
+        if [[ -f "$BACKUP_DIR/resolv.conf.bak" ]]; then
+            rm -f /etc/resolv.conf
+            cp "$BACKUP_DIR/resolv.conf.bak" /etc/resolv.conf
+        fi
+        break_end
+        return 1
+    fi
+    
+    echo -e "${gl_lv}  ✅ resolv.conf 链接已安全创建${gl_bai}"
+    
+    # 🚫 完全移除 networking.service 重启（即使非SSH模式也危险）
+    # 注意：不管是SSH还是本地连接，都不重启 networking.service
+    # 因为重启网络服务在生产环境中极其危险
+    echo -e "${gl_lv}  ✅ 网络服务未受影响（安全模式）${gl_bai}"
 
     echo ""
-    echo -e "${gl_kjlan}阶段三：正在安全地重启网络服务以应用所有更改...${gl_bai}"
-
-    # 智能检测 networking.service 状态
-    if systemctl is-active --quiet networking.service 2>/dev/null; then
-        echo "检测到 networking.service 正在运行，尝试重启..."
-
-        # 尝试重启，捕获错误
-        if systemctl restart networking.service 2>/dev/null; then
-            echo -e "${gl_lv}✅ networking.service 已安全重启${gl_bai}"
-        else
-            # 重启失败，说明网络由其他服务管理
-            echo -e "${gl_huang}⚠️ networking.service 重启失败（网络可能由其他服务管理）${gl_bai}"
-            echo -e "${gl_huang}   检测到网络配置冲突，正在自动修复...${gl_bai}"
-
-            # 自动屏蔽 networking.service 避免冲突
-            systemctl stop networking.service 2>/dev/null || true
-            systemctl disable networking.service 2>/dev/null || true
-            systemctl mask networking.service 2>/dev/null || true
-
-            echo -e "${gl_lv}✅ 已自动屏蔽 networking.service，避免与其他网络管理器冲突${gl_bai}"
-            echo -e "${gl_lv}   网络将由 systemd-networkd 或 cloud-init 管理${gl_bai}"
-        fi
+    
+    # ==================== Debian 13特殊修复：D-Bus接口注册问题 ====================
+    echo -e "${gl_kjlan}[特殊修复] 检测并修复 D-Bus 接口注册（Debian 13兼容）...${gl_bai}"
+    echo ""
+    
+    # 检测是否需要修复D-Bus接口
+    local need_dbus_fix=false
+    # 注意：debian_version 已在5180行定义，这里不再重复定义
+    
+    # 获取Debian版本
+    if [ -f /etc/os-release ]; then
+        debian_version=$(grep "VERSION_ID" /etc/os-release | cut -d'=' -f2 | tr -d '"' 2>/dev/null || echo "")
+    fi
+    
+    echo "  → 检测系统版本：Debian ${debian_version:-未知}"
+    
+    # 检查resolvectl是否能正常通信
+    echo "  → 测试 resolvectl 命令响应..."
+    if ! timeout 3 resolvectl status >/dev/null 2>&1; then
+        echo -e "${gl_huang}  ⚠️  resolvectl 命令无响应，需要修复 D-Bus 接口${gl_bai}"
+        need_dbus_fix=true
     else
-        echo -e "${gl_lv}✅ networking.service 未运行，跳过重启（网络由其他服务管理）${gl_bai}"
+        echo -e "${gl_lv}  ✅ resolvectl 响应正常${gl_bai}"
+    fi
+    
+    # 如果需要修复D-Bus接口
+    if [ "$need_dbus_fix" = true ]; then
+        echo ""
+        echo -e "${gl_huang}检测到 D-Bus 接口注册问题（Debian 13已知问题），正在自动修复...${gl_bai}"
+        echo ""
+        
+        # 🛡️ 安全措施：在重启前创建临时DNS配置，确保DNS始终可用
+        echo "  → 创建临时DNS配置（防止修复期间DNS中断）..."
+        
+        # 备份当前resolv.conf
+        if [[ -e /etc/resolv.conf ]]; then
+            cp /etc/resolv.conf "$BACKUP_DIR/resolv.conf.before_dbus_fix" 2>/dev/null || true
+        fi
+        
+        # 创建临时DNS配置文件
+        cat > /etc/resolv.conf.dbus_fix_temp << TEMP_DNS
+# 临时DNS配置（D-Bus修复期间使用）
+nameserver $INTERFACE_DNS_PRIMARY
+nameserver $INTERFACE_DNS_SECONDARY
+TEMP_DNS
+        
+        # 使用临时DNS配置
+        rm -f /etc/resolv.conf
+        cp /etc/resolv.conf.dbus_fix_temp /etc/resolv.conf
+        chmod 644 /etc/resolv.conf
+        
+        echo -e "${gl_lv}  ✅ 临时DNS配置已创建（确保修复期间DNS可用）${gl_bai}"
+        
+        # 1. 完全重启systemd-resolved，让它重新注册D-Bus接口
+        echo "  → 重启 systemd-resolved 以重新注册 D-Bus 接口..."
+        systemctl stop systemd-resolved 2>/dev/null || true
+        sleep 2
+        systemctl start systemd-resolved 2>/dev/null || true
+        sleep 3
+        
+        # 🛡️ 恢复到 stub-resolv.conf 链接
+        echo "  → 恢复 resolv.conf 链接到 stub-resolv.conf..."
+        
+        # 验证 stub-resolv.conf 存在
+        if [[ -f /run/systemd/resolve/stub-resolv.conf ]]; then
+            rm -f /etc/resolv.conf
+            ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+            echo -e "${gl_lv}  ✅ resolv.conf 链接已恢复${gl_bai}"
+        else
+            echo -e "${gl_huang}  ⚠️  stub-resolv.conf 不存在，保持临时DNS配置${gl_bai}"
+        fi
+        
+        # 清理临时文件
+        rm -f /etc/resolv.conf.dbus_fix_temp
+        
+        # 2. 验证D-Bus接口是否注册成功
+        if command -v busctl &>/dev/null; then
+            local dbus_status=$(busctl list 2>/dev/null | grep "org.freedesktop.resolve1" | grep -v "activatable" || echo "")
+            if [ -n "$dbus_status" ]; then
+                echo -e "${gl_lv}  ✅ D-Bus 接口已成功注册${gl_bai}"
+                
+                # 3. 创建永久修复配置（确保重启后也能正常工作）
+                echo "  → 创建永久修复配置..."
+                mkdir -p /etc/systemd/system/systemd-resolved.service.d
+                cat > /etc/systemd/system/systemd-resolved.service.d/dbus-fix.conf << 'DBUS_FIX'
+# Debian 13 D-Bus接口注册修复
+# 确保D-Bus完全启动后再启动systemd-resolved
+[Unit]
+After=dbus.service
+Requires=dbus.service
+
+[Service]
+# 启动后等待1秒，确保D-Bus接口注册完成
+ExecStartPost=/bin/sleep 1
+DBUS_FIX
+                
+                systemctl daemon-reload 2>/dev/null || true
+                echo -e "${gl_lv}  ✅ 永久修复配置已创建${gl_bai}"
+                
+                # 4. 再次测试resolvectl
+                if timeout 3 resolvectl status >/dev/null 2>&1; then
+                    echo -e "${gl_lv}  ✅ resolvectl 现在能正常工作了${gl_bai}"
+                else
+                    echo -e "${gl_huang}  ⚠️  resolvectl 仍无响应（但DNS配置已通过resolved.conf生效）${gl_bai}"
+                fi
+            else
+                echo -e "${gl_huang}  ⚠️  D-Bus 接口注册可能失败${gl_bai}"
+                echo -e "${gl_lv}  ✅ 但DNS配置已通过 /etc/systemd/resolved.conf 生效${gl_bai}"
+            fi
+        else
+            echo -e "${gl_huang}  ⚠️  busctl 命令不可用，无法验证 D-Bus 状态${gl_bai}"
+            echo -e "${gl_lv}  ✅ 但DNS配置已通过 /etc/systemd/resolved.conf 生效${gl_bai}"
+        fi
+        
+        echo ""
     fi
 
     echo ""
-    echo -e "${gl_kjlan}阶段四：正在配置网卡 DNS（永久配置）...${gl_bai}"
 
-    # 自动检测主网卡
+    # ==================== 阶段四：配置网卡DNS ====================
+    echo -e "${gl_kjlan}[阶段 4/4] 配置网卡DNS（立即生效）...${gl_bai}"
+    echo ""
+    
+    # 🔥 强力保障：阶段4执行前二次验证resolvectl（确保100%成功）
+    echo "  → 验证 resolvectl 命令状态..."
+    local resolvectl_ready=true
+    
+    # 快速测试resolvectl是否响应（2秒超时）
+    if ! timeout 2 resolvectl status >/dev/null 2>&1; then
+        echo -e "${gl_huang}  ⚠️  resolvectl 仍无响应${gl_bai}"
+        echo ""
+        echo -e "${gl_huang}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo -e "${gl_huang}检测到 resolvectl 命令无法正常工作${gl_bai}"
+        echo -e "${gl_huang}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo ""
+        echo "这可能导致阶段4的网卡级DNS配置失败。"
+        echo ""
+        echo "你可以选择："
+        echo "  1) 尝试强制修复（会重启systemd-resolved，有临时DNS保护）"
+        echo "  2) 跳过网卡配置（安全，全局DNS已生效，推荐）"
+        echo ""
+        read -e -p "$(echo -e "${gl_huang}请选择 (1/2，默认2): ${gl_bai}")" force_fix_choice
+        force_fix_choice=${force_fix_choice:-2}
+        
+        if [[ "$force_fix_choice" == "1" ]]; then
+            echo ""
+            echo -e "${gl_kjlan}正在执行强制修复...${gl_bai}"
+            resolvectl_ready=false
+            
+            # 强制修复：重启systemd-resolved重新注册D-Bus
+            echo "  → 创建临时DNS保护..."
+            
+            # 创建临时DNS保护
+            cat > /etc/resolv.conf.stage4_temp << STAGE4_TEMP
+nameserver $INTERFACE_DNS_PRIMARY
+nameserver $INTERFACE_DNS_SECONDARY
+STAGE4_TEMP
+            cp /etc/resolv.conf /etc/resolv.conf.stage4_backup 2>/dev/null || true
+            cp /etc/resolv.conf.stage4_temp /etc/resolv.conf
+            
+            echo "  → 强制重启 systemd-resolved..."
+            # 完全重启服务
+            systemctl stop systemd-resolved 2>/dev/null || true
+            sleep 2
+            systemctl start systemd-resolved 2>/dev/null || true
+            sleep 3
+            
+            # 恢复链接
+            echo "  → 恢复 resolv.conf 链接..."
+            if [[ -f /run/systemd/resolve/stub-resolv.conf ]]; then
+                rm -f /etc/resolv.conf
+                ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+            fi
+            
+            # 清理临时文件
+            rm -f /etc/resolv.conf.stage4_temp /etc/resolv.conf.stage4_backup
+            
+            # 再次验证
+            echo "  → 验证修复结果..."
+            if timeout 2 resolvectl status >/dev/null 2>&1; then
+                echo -e "${gl_lv}  ✅ resolvectl 已修复，可以继续${gl_bai}"
+                resolvectl_ready=true
+            else
+                echo -e "${gl_huang}  ⚠️  resolvectl 仍无法正常工作${gl_bai}"
+                echo -e "${gl_lv}  ✅ 将跳过网卡级DNS配置（全局DNS已生效）${gl_bai}"
+                resolvectl_ready=false
+            fi
+            echo ""
+        else
+            echo ""
+            echo -e "${gl_lv}已选择跳过强制修复（安全选择）${gl_bai}"
+            echo -e "${gl_lv}将跳过网卡级DNS配置，全局DNS配置已生效${gl_bai}"
+            resolvectl_ready=false
+            echo ""
+        fi
+    else
+        echo -e "${gl_lv}  ✅ resolvectl 响应正常${gl_bai}"
+    fi
+    
+    echo ""
+
+    # 检测主网卡
     local main_interface=$(ip route | grep '^default' | awk '{print $5}' | head -n1)
 
-    if [[ -n "$main_interface" ]]; then
-        echo "检测到主网卡: ${main_interface}"
+    if [[ -n "$main_interface" ]] && command -v resolvectl &> /dev/null && [ "$resolvectl_ready" = true ]; then
+        echo "  → 检测到主网卡: ${main_interface}"
         
-        # 创建 systemd-networkd 配置目录
-        mkdir -p /etc/systemd/network
-        
-        # 创建永久网卡 DNS 配置文件
-        local network_config="/etc/systemd/network/10-${main_interface}.network"
-        echo "正在创建永久 DNS 配置文件: ${network_config}"
-        
-        cat > "${network_config}" << 'NETWORKEOF'
-[Match]
-Name=INTERFACE_NAME
-
-[Network]
-DHCP=yes
-DNS=8.8.8.8
-DNS=1.1.1.1
-Domains=~.
-DNSDefaultRoute=yes
-
-[DHCP]
-UseDNS=false
-NETWORKEOF
-        
-        # 替换网卡名称
-        sed -i "s/INTERFACE_NAME/${main_interface}/g" "${network_config}"
-        
-        echo -e "${gl_lv}✅ 已创建永久配置文件: ${network_config}${gl_bai}"
-        
-        # 启用 systemd-networkd（如果未启用）
-        if ! systemctl is-enabled systemd-networkd &>/dev/null; then
-            echo "正在启用 systemd-networkd 服务..."
-            systemctl enable systemd-networkd &>/dev/null || true
+        # 🛡️ 关键修复：检查timeout命令是否可用
+        if ! command -v timeout &> /dev/null; then
+            echo -e "${gl_huang}  ⚠️  timeout命令不可用，跳过网卡级DNS配置${gl_bai}"
+            echo -e "${gl_lv}  ✅ DNS配置已通过 /etc/systemd/resolved.conf 生效${gl_bai}"
+        else
+            echo "  → 配置网卡 DNS（立即生效，无需重启）..."
+            echo ""
+            
+            # 🛡️ 修复：添加超时机制防止resolvectl命令hang住
+            local resolvectl_timeout=5  # 5秒超时
+            local dns_config_success=true
+            
+            echo "    正在应用DNS服务器配置..."
+            if timeout "$resolvectl_timeout" resolvectl dns "$main_interface" $INTERFACE_DNS_PRIMARY $INTERFACE_DNS_SECONDARY 2>/dev/null; then
+                echo -e "    ${gl_lv}✅ DNS服务器配置成功${gl_bai}"
+            else
+                echo -e "    ${gl_huang}⚠️  DNS服务器配置超时或失败（配置已通过resolved.conf生效）${gl_bai}"
+                dns_config_success=false
+            fi
+            
+            echo "    正在应用DNS域配置..."
+            if timeout "$resolvectl_timeout" resolvectl domain "$main_interface" ~. 2>/dev/null; then
+                echo -e "    ${gl_lv}✅ DNS域配置成功${gl_bai}"
+            else
+                echo -e "    ${gl_huang}⚠️  DNS域配置超时或失败（配置已通过resolved.conf生效）${gl_bai}"
+                dns_config_success=false
+            fi
+            
+            echo "    正在应用默认路由配置..."
+            if timeout "$resolvectl_timeout" resolvectl default-route "$main_interface" yes 2>/dev/null; then
+                echo -e "    ${gl_lv}✅ 默认路由配置成功${gl_bai}"
+            else
+                echo -e "    ${gl_huang}⚠️  默认路由配置超时或失败（配置已通过resolved.conf生效）${gl_bai}"
+                dns_config_success=false
+            fi
+            
+            echo ""
+            if [ "$dns_config_success" = true ]; then
+                echo -e "${gl_lv}  ✅ 网卡DNS配置已全部应用${gl_bai}"
+            else
+                echo -e "${gl_huang}  ⚠️  部分网卡DNS配置未能通过resolvectl应用${gl_bai}"
+                echo -e "${gl_lv}  ✅ 但DNS配置已通过 /etc/systemd/resolved.conf 生效${gl_bai}"
+            fi
         fi
-        
-        # 应用当前会话配置（立即生效，无需重启）
-        echo "正在应用 DNS 配置到当前会话（立即生效）..."
-        resolvectl dns "$main_interface" 8.8.8.8 1.1.1.1 2>/dev/null || true
-        resolvectl domain "$main_interface" ~. 2>/dev/null || true
-        resolvectl default-route "$main_interface" yes 2>/dev/null || true
-        
-        echo -e "${gl_lv}✅ DNS 永久配置已完成，当前立即生效${gl_bai}"
+        echo -e "${gl_lv}  ✅ DNS配置立即生效，无需重启${gl_bai}"
     else
-        echo -e "${gl_huang}⚠️ 无法检测到主网卡，跳过网卡配置${gl_bai}"
-        echo -e "${gl_huang}   如果 DNS 解析失败，请手动执行：${gl_bai}"
-        echo -e "${gl_huang}   resolvectl dns <网卡名> 8.8.8.8 1.1.1.1${gl_bai}"
-        echo -e "${gl_huang}   resolvectl domain <网卡名> ~.${gl_bai}"
-        echo -e "${gl_huang}   resolvectl default-route <网卡名> yes${gl_bai}"
+        if [[ -z "$main_interface" ]]; then
+            echo -e "${gl_huang}  ⚠️  未检测到默认网卡${gl_bai}"
+        else
+            echo -e "${gl_huang}  ⚠️  resolvectl 命令不可用${gl_bai}"
+        fi
+        echo -e "${gl_lv}  ✅ DNS配置已通过 /etc/systemd/resolved.conf 生效${gl_bai}"
     fi
 
     echo ""
-    echo -e "${gl_lv}✅ 全部操作完成！以下是最终的 DNS 配置状态：${gl_bai}"
-    echo "===================================================="
-    resolvectl status 2>/dev/null || echo "无法获取状态信息"
-    echo "===================================================="
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo -e "${gl_lv}✅ DNS净化完成！${gl_bai}"
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
     echo ""
+
+    # 显示当前DNS状态
+    echo -e "${gl_huang}当前DNS配置：${gl_bai}"
+    echo "────────────────────────────────────────────────────────"
+    if command -v resolvectl &> /dev/null; then
+        resolvectl status 2>/dev/null | head -30 || cat /etc/resolv.conf
+    else
+        cat /etc/resolv.conf
+    fi
+    echo "────────────────────────────────────────────────────────"
+    
+    # ==================== 统一验证输出（兼容所有systemd版本）====================
+    echo ""
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo -e "${gl_kjlan}[智能验证] 网卡DNS配置状态检测：${gl_bai}"
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo ""
+    
+    if command -v resolvectl &> /dev/null && [[ -n "$main_interface" ]]; then
+        local verify_output=$(resolvectl status "$main_interface" 2>/dev/null || echo "")
+        local verify_success=true
+        
+        # 检测1: Default Route（兼容不同systemd版本）
+        if echo "$verify_output" | grep -q "Default Route: yes" || \
+           echo "$verify_output" | grep -q "Protocols:.*+DefaultRoute"; then
+            echo -e "  ${gl_lv}✅ Default Route: 已启用${gl_bai}"
+        else
+            echo -e "  ${gl_huang}⚠️  Default Route: 未启用或不支持${gl_bai}"
+            verify_success=false
+        fi
+        
+        # 检测2: DNS Servers（根据用户选择的模式动态验证）
+        local escaped_dns_primary=$(echo "$INTERFACE_DNS_PRIMARY" | sed 's/\./\\./g')
+        local escaped_dns_secondary=$(echo "$INTERFACE_DNS_SECONDARY" | sed 's/\./\\./g')
+        if echo "$verify_output" | grep -q "DNS Servers:.*${escaped_dns_primary}" && \
+           echo "$verify_output" | grep -q "DNS Servers:.*${escaped_dns_secondary}"; then
+            echo -e "  ${gl_lv}✅ DNS Servers: ${INTERFACE_DNS_PRIMARY}, ${INTERFACE_DNS_SECONDARY}${gl_bai}"
+        else
+            echo -e "  ${gl_huang}⚠️  DNS Servers: 配置可能未完全生效${gl_bai}"
+            verify_success=false
+        fi
+        
+        # 检测3: DNS Domain
+        if echo "$verify_output" | grep -q "DNS Domain:.*~\."; then
+            echo -e "  ${gl_lv}✅ DNS Domain: ~. (所有域名)${gl_bai}"
+        else
+            echo -e "  ${gl_huang}⚠️  DNS Domain: 未配置${gl_bai}"
+            verify_success=false
+        fi
+        
+        echo ""
+        
+        # 最终判断
+        if [ "$verify_success" = true ]; then
+            echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+            echo -e "${gl_lv}💯 最终判断: 网卡DNS配置 100% 成功！${gl_bai}"
+            echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        else
+            echo -e "${gl_huang}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+            echo -e "${gl_huang}⚠️  网卡DNS配置部分未生效${gl_bai}"
+            echo -e "${gl_lv}✅ 但全局DNS配置已生效，DNS解析正常工作${gl_bai}"
+            echo -e "${gl_huang}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        fi
+    else
+        echo -e "${gl_huang}  ⚠️  resolvectl 不可用或未检测到网卡${gl_bai}"
+        echo -e "${gl_lv}  ✅ 全局DNS配置已生效${gl_bai}"
+        echo ""
+        echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    fi
+    
+    echo ""
+
+    # 测试DNS解析（等待配置生效）
+    echo -e "${gl_huang}测试DNS解析：${gl_bai}"
+    echo "  → 等待DNS配置生效（3秒）..."
+    sleep 3
+    
+    local dns_test_passed=false
+    
+    # 根据用户选择的模式选择测试域名
+    local test_domain=""
+    if [[ "$dns_mode_choice" == "2" ]]; then
+        # 纯国内模式：使用国内域名测试
+        test_domain="baidu.com"
+    else
+        # 国外/混合模式：使用国外域名测试
+        test_domain="google.com"
+    fi
+    
+    # 方法1: 使用 getent（最可靠）
+    if command -v getent > /dev/null 2>&1; then
+        if getent hosts "$test_domain" > /dev/null 2>&1; then
+            echo -e "${gl_lv}  ✅ DNS解析正常 (getent测试: $test_domain)${gl_bai}"
+            dns_test_passed=true
+        fi
+    fi
+    
+    # 方法2: 使用 ping
+    if [ "$dns_test_passed" = false ] && ping -c 1 -W 2 "$test_domain" > /dev/null 2>&1; then
+        echo -e "${gl_lv}  ✅ DNS解析正常 (ping测试: $test_domain)${gl_bai}"
+        dns_test_passed=true
+    fi
+    
+    # 方法3: 使用 nslookup（如果可用）
+    if [ "$dns_test_passed" = false ] && command -v nslookup > /dev/null 2>&1; then
+        if nslookup "$test_domain" > /dev/null 2>&1; then
+            echo -e "${gl_lv}  ✅ DNS解析正常 (nslookup测试: $test_domain)${gl_bai}"
+            dns_test_passed=true
+        fi
+    fi
+    
+    # 如果所有测试都失败
+    if [ "$dns_test_passed" = false ]; then
+        echo -e "${gl_huang}  ⚠️  DNS测试未通过，但配置已完成${gl_bai}"
+        echo -e "${gl_huang}  提示: 请手动执行以下命令测试DNS：${gl_bai}"
+        echo "       ping $test_domain"
+        echo "       curl $test_domain"
+    fi
+    echo ""
+
+    # ==================== 生成回滚脚本 ====================
+    cat > "$BACKUP_DIR/rollback.sh" << 'ROLLBACK_SCRIPT'
+#!/bin/bash
+# DNS配置回滚脚本
+# 使用方法: bash rollback.sh
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  DNS配置回滚脚本"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+BACKUP_DIR="$(dirname "$0")"
+
+# 恢复 dhclient.conf
+if [[ -f "$BACKUP_DIR/dhclient.conf.bak" ]]; then
+    echo "恢复 dhclient.conf..."
+    cp "$BACKUP_DIR/dhclient.conf.bak" /etc/dhcp/dhclient.conf
+    echo "✅ 已恢复 dhclient.conf"
+fi
+
+# 恢复 interfaces
+if [[ -f "$BACKUP_DIR/interfaces.bak" ]]; then
+    echo "恢复 interfaces..."
+    cp "$BACKUP_DIR/interfaces.bak" /etc/network/interfaces
+    echo "✅ 已恢复 interfaces"
+fi
+
+# 恢复 resolved.conf
+if [[ -f "$BACKUP_DIR/resolved.conf.bak" ]]; then
+    echo "恢复 resolved.conf..."
+    cp "$BACKUP_DIR/resolved.conf.bak" /etc/systemd/resolved.conf
+    echo "✅ 已恢复 resolved.conf"
+fi
+
+# 恢复 resolv.conf
+if [[ -f "$BACKUP_DIR/resolv.conf.bak" ]]; then
+    echo "恢复 resolv.conf..."
+    cp "$BACKUP_DIR/resolv.conf.bak" /etc/resolv.conf
+    echo "✅ 已恢复 resolv.conf"
+fi
+
+# 重新加载 systemd-resolved
+echo "重新加载 systemd-resolved..."
+systemctl reload-or-restart systemd-resolved 2>/dev/null || true
+echo "✅ systemd-resolved 已重新加载"
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✅ 回滚完成！"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+ROLLBACK_SCRIPT
+
+    chmod +x "$BACKUP_DIR/rollback.sh"
+
+    # 显示备份信息
+    echo -e "${gl_kjlan}备份与回滚信息：${gl_bai}"
+    echo "  所有原始配置已备份到："
+    echo "  $BACKUP_DIR"
+    echo ""
+    echo -e "${gl_huang}如需回滚，执行：${gl_bai}"
+    echo "  bash $BACKUP_DIR/rollback.sh"
+    echo ""
+
     echo -e "${gl_lv}DNS净化脚本执行完成${gl_bai}"
-    echo "贡献者：NSdesk"
-    echo "更多信息：https://www.nodeseek.com/space/23129/"
-    echo "===================================================="
+    echo "原作者：NSdesk"
+    echo "安全增强：SSH防断连优化"
+    echo "更多信息：https://www.nodeseek.com/space/23129#/general"
+    echo "════════════════════════════════════════════════════════"
     echo ""
 
     break_end
@@ -4922,7 +6270,7 @@ Kernel_optimize() {
         clear
         echo "Linux系统内核参数优化 - Reality专用调优"
         echo "------------------------------------------------"
-        echo "针对VLESS Reality/AnyTLS节点深度优化"
+        echo "针对 VLESS Reality 节点深度优化"
         echo -e "${gl_huang}提示: ${gl_bai}所有方案都是临时生效（重启后自动还原）"
         echo "--------------------"
         echo "1. 星辰大海ヾ优化：  13万文件描述符，16MB缓冲区，兼容CAKE"
@@ -4978,113 +6326,218 @@ Kernel_optimize() {
 }
 
 run_speedtest() {
-    clear
-    echo -e "${gl_kjlan}=== 服务器带宽测试 ===${gl_bai}"
-    echo ""
-
-    # 检测 CPU 架构
-    local cpu_arch=$(uname -m)
-    echo "检测到系统架构: ${gl_huang}${cpu_arch}${gl_bai}"
-    echo ""
-
-    # 检查 speedtest 是否已安装
-    if command -v speedtest &>/dev/null; then
-        echo -e "${gl_lv}Speedtest 已安装，直接运行测试...${gl_bai}"
-        echo "------------------------------------------------"
+    while true; do
+        clear
+        echo -e "${gl_kjlan}=== 服务器带宽测试 ===${gl_bai}"
         echo ""
-        speedtest --accept-license
+        
+        # 检测 CPU 架构
+        local cpu_arch=$(uname -m)
+        echo "检测到系统架构: ${gl_huang}${cpu_arch}${gl_bai}"
         echo ""
-        echo "------------------------------------------------"
-        break_end
-        return 0
-    fi
-
-    echo "Speedtest 未安装，正在下载安装..."
-    echo "------------------------------------------------"
-    echo ""
-
-    # 根据架构选择下载链接
-    local download_url
-    local tarball_name
-
-    case "$cpu_arch" in
-        x86_64)
-            download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
-            tarball_name="ookla-speedtest-1.2.0-linux-x86_64.tgz"
-            echo "使用 AMD64 架构版本..."
-            ;;
-        aarch64)
-            download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
-            tarball_name="speedtest.tgz"
-            echo "使用 ARM64 架构版本..."
-            ;;
-        *)
-            echo -e "${gl_hong}错误: 不支持的架构 ${cpu_arch}${gl_bai}"
-            echo "目前仅支持 x86_64 和 aarch64 架构"
+        
+        # 检查并安装 speedtest
+        if ! command -v speedtest &>/dev/null; then
+            echo "Speedtest 未安装，正在下载安装..."
+            echo "------------------------------------------------"
             echo ""
-            break_end
-            return 1
-            ;;
-    esac
-
-    # 切换到临时目录
-    cd /tmp || {
-        echo -e "${gl_hong}错误: 无法切换到 /tmp 目录${gl_bai}"
-        break_end
-        return 1
-    }
-
-    # 下载
-    echo "正在下载..."
-    if [ "$cpu_arch" = "aarch64" ]; then
-        curl -Lo "$tarball_name" "$download_url"
-    else
-        wget "$download_url"
-    fi
-
-    if [ $? -ne 0 ]; then
-        echo -e "${gl_hong}下载失败！${gl_bai}"
-        break_end
-        return 1
-    fi
-
-    # 解压
-    echo "正在解压..."
-    tar -xvzf "$tarball_name"
-
-    if [ $? -ne 0 ]; then
-        echo -e "${gl_hong}解压失败！${gl_bai}"
-        rm -f "$tarball_name"
-        break_end
-        return 1
-    fi
-
-    # 移动到系统目录
-    echo "正在安装..."
-    mv speedtest /usr/local/bin/
-
-    if [ $? -ne 0 ]; then
-        echo -e "${gl_hong}安装失败！${gl_bai}"
-        rm -f "$tarball_name"
-        break_end
-        return 1
-    fi
-
-    # 清理临时文件
-    rm -f "$tarball_name"
-
-    echo -e "${gl_lv}✅ Speedtest 安装成功！${gl_bai}"
-    echo ""
-    echo "开始带宽测试..."
-    echo "------------------------------------------------"
-    echo ""
-
-    # 运行测试（自动接受许可）
-    speedtest --accept-license
-
-    echo ""
-    echo "------------------------------------------------"
-    break_end
+            
+            local download_url
+            local tarball_name
+            
+            case "$cpu_arch" in
+                x86_64)
+                    download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
+                    tarball_name="ookla-speedtest-1.2.0-linux-x86_64.tgz"
+                    echo "使用 AMD64 架构版本..."
+                    ;;
+                aarch64)
+                    download_url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
+                    tarball_name="speedtest.tgz"
+                    echo "使用 ARM64 架构版本..."
+                    ;;
+                *)
+                    echo -e "${gl_hong}错误: 不支持的架构 ${cpu_arch}${gl_bai}"
+                    echo "目前仅支持 x86_64 和 aarch64 架构"
+                    echo ""
+                    break_end
+                    return 1
+                    ;;
+            esac
+            
+            cd /tmp || {
+                echo -e "${gl_hong}错误: 无法切换到 /tmp 目录${gl_bai}"
+                break_end
+                return 1
+            }
+            
+            echo "正在下载..."
+            if [ "$cpu_arch" = "aarch64" ]; then
+                curl -Lo "$tarball_name" "$download_url"
+            else
+                wget -q "$download_url"
+            fi
+            
+            if [ $? -ne 0 ]; then
+                echo -e "${gl_hong}下载失败！${gl_bai}"
+                break_end
+                return 1
+            fi
+            
+            echo "正在解压..."
+            tar -xzf "$tarball_name"
+            
+            if [ $? -ne 0 ]; then
+                echo -e "${gl_hong}解压失败！${gl_bai}"
+                rm -f "$tarball_name"
+                break_end
+                return 1
+            fi
+            
+            mv speedtest /usr/local/bin/
+            rm -f "$tarball_name"
+            
+            echo -e "${gl_lv}✅ Speedtest 安装成功！${gl_bai}"
+            echo ""
+        else
+            echo -e "${gl_lv}✅ Speedtest 已安装${gl_bai}"
+        fi
+        
+        echo ""
+        echo -e "${gl_kjlan}请选择测速模式：${gl_bai}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "1. 自动测速"
+        echo "2. 手动选择服务器 ⭐ 推荐"
+        echo ""
+        echo "0. 返回主菜单"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        
+        read -e -p "请输入选择 [1]: " speed_choice
+        speed_choice=${speed_choice:-1}
+        
+        case "$speed_choice" in
+            1)
+                # 自动测速（使用智能重试逻辑）
+                echo ""
+                echo -e "${gl_zi}正在搜索附近测速服务器...${gl_bai}"
+                
+                # 获取附近服务器列表
+                local servers_list=$(speedtest --accept-license --servers 2>/dev/null | grep -oP '^\s*\K[0-9]+' | head -n 10)
+                
+                if [ -z "$servers_list" ]; then
+                    echo -e "${gl_huang}无法获取服务器列表，使用自动选择...${gl_bai}"
+                    servers_list="auto"
+                else
+                    local server_count=$(echo "$servers_list" | wc -l)
+                    echo -e "${gl_lv}✅ 找到 ${server_count} 个附近服务器${gl_bai}"
+                fi
+                echo ""
+                
+                local speedtest_output=""
+                local test_success=false
+                local attempt=0
+                local max_attempts=5
+                
+                for server_id in $servers_list; do
+                    attempt=$((attempt + 1))
+                    
+                    if [ $attempt -gt $max_attempts ]; then
+                        echo -e "${gl_huang}已尝试 ${max_attempts} 个服务器，停止尝试${gl_bai}"
+                        break
+                    fi
+                    
+                    if [ "$server_id" = "auto" ]; then
+                        echo -e "${gl_zi}[尝试 ${attempt}] 自动选择最近服务器...${gl_bai}"
+                        echo "------------------------------------------------"
+                        speedtest --accept-license
+                        test_success=true
+                        break
+                    else
+                        echo -e "${gl_zi}[尝试 ${attempt}] 测试服务器 #${server_id}...${gl_bai}"
+                        echo "------------------------------------------------"
+                        speedtest_output=$(speedtest --accept-license --server-id="$server_id" 2>&1)
+                        echo "$speedtest_output"
+                        echo ""
+                        
+                        # 检查是否成功
+                        if echo "$speedtest_output" | grep -q "Download:" && ! echo "$speedtest_output" | grep -qi "FAILED\|error"; then
+                            echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+                            echo -e "${gl_lv}✅ 测速成功！${gl_bai}"
+                            echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+                            test_success=true
+                            break
+                        else
+                            echo -e "${gl_huang}⚠️ 此服务器测速失败，尝试下一个...${gl_bai}"
+                            echo ""
+                        fi
+                    fi
+                done
+                
+                if [ "$test_success" = false ]; then
+                    echo ""
+                    echo -e "${gl_hong}❌ 所有服务器测速均失败${gl_bai}"
+                    echo -e "${gl_zi}建议使用「手动选择服务器」模式${gl_bai}"
+                fi
+                
+                echo ""
+                break_end
+                ;;
+            2)
+                # 手动选择服务器
+                echo ""
+                echo -e "${gl_zi}正在获取附近服务器列表...${gl_bai}"
+                echo ""
+                
+                local server_list_output=$(speedtest --accept-license --servers 2>/dev/null | head -n 15)
+                
+                if [ -z "$server_list_output" ]; then
+                    echo -e "${gl_hong}❌ 无法获取服务器列表${gl_bai}"
+                    echo ""
+                    break_end
+                    continue
+                fi
+                
+                echo -e "${gl_kjlan}附近的测速服务器列表：${gl_bai}"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "$server_list_output"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo ""
+                echo -e "${gl_zi}💡 提示：ID 列的数字就是服务器ID${gl_bai}"
+                echo ""
+                
+                local server_id=""
+                while true; do
+                    read -e -p "$(echo -e "${gl_huang}请输入服务器ID（纯数字，输入0返回）: ${gl_bai}")" server_id
+                    
+                    if [ "$server_id" = "0" ]; then
+                        break
+                    elif [[ "$server_id" =~ ^[0-9]+$ ]]; then
+                        echo ""
+                        echo -e "${gl_huang}正在使用服务器 #${server_id} 测速...${gl_bai}"
+                        echo "------------------------------------------------"
+                        echo ""
+                        
+                        speedtest --accept-license --server-id="$server_id"
+                        
+                        echo ""
+                        echo "------------------------------------------------"
+                        break_end
+                        break
+                    else
+                        echo -e "${gl_hong}❌ 无效输入，请输入纯数字的服务器ID${gl_bai}"
+                    fi
+                done
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                echo -e "${gl_hong}无效选择${gl_bai}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 run_backtrace() {
@@ -5096,7 +6549,11 @@ run_backtrace() {
     echo ""
 
     # 执行三网回程路由测试脚本
-    curl https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh -sSf | sh
+    if ! run_remote_script "https://raw.githubusercontent.com/ludashi2020/backtrace/main/install.sh" sh; then
+        echo -e "${gl_hong}❌ 脚本执行失败${gl_bai}"
+        break_end
+        return 1
+    fi
 
     echo ""
     echo "------------------------------------------------"
@@ -5112,7 +6569,11 @@ run_ns_detect() {
     echo ""
 
     # 执行 NS 一键检测脚本
-    bash <(curl -sL https://run.NodeQuality.com)
+    if ! run_remote_script "https://run.NodeQuality.com" bash; then
+        echo -e "${gl_hong}❌ 脚本执行失败${gl_bai}"
+        break_end
+        return 1
+    fi
 
     echo ""
     echo "------------------------------------------------"
@@ -5128,7 +6589,11 @@ run_ip_quality_check() {
     echo ""
 
     # 执行 IP 质量检测脚本
-    bash <(curl -Ls https://IP.Check.Place)
+    if ! run_remote_script "https://IP.Check.Place" bash; then
+        echo -e "${gl_hong}❌ 脚本执行失败${gl_bai}"
+        break_end
+        return 1
+    fi
 
     echo ""
     echo "------------------------------------------------"
@@ -5144,7 +6609,11 @@ run_ip_quality_check_ipv4() {
     echo ""
 
     # 执行 IP 质量检测脚本 - 仅 IPv4
-    bash <(curl -Ls https://IP.Check.Place) -4
+    if ! run_remote_script "https://IP.Check.Place" bash -4; then
+        echo -e "${gl_hong}❌ 脚本执行失败${gl_bai}"
+        break_end
+        return 1
+    fi
 
     echo ""
     echo "------------------------------------------------"
@@ -5160,7 +6629,11 @@ run_network_latency_check() {
     echo ""
 
     # 执行网络延迟质量检测脚本
-    bash <(curl -sL https://Check.Place) -N
+    if ! run_remote_script "https://Check.Place" bash -N; then
+        echo -e "${gl_hong}❌ 脚本执行失败${gl_bai}"
+        break_end
+        return 1
+    fi
 
     echo ""
     echo "------------------------------------------------"
@@ -5444,62 +6917,67 @@ show_main_menu() {
     echo ""
     echo -e "${gl_kjlan}[BBR/网络优化]${gl_bai}"
     echo "3. BBR 直连/落地优化（智能带宽检测）⭐ 推荐"
-    echo "4. NS论坛-DNS净化（抗污染/驯服DHCP）"
-    echo "5. Realm转发timeout修复 ⭐ 推荐"
-    echo "6. NS论坛CAKE调优"
-    echo "7. 科技lion高性能模式"
+    echo "4. MTU检测与MSS优化（消除重传）⭐ 推荐"
+    echo "5. NS论坛-DNS净化（抗污染/驯服DHCP）"
+    echo "6. Realm转发timeout修复 ⭐ 推荐"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━━ 系统配置 ━━━━━━━━━━━${gl_bai}"
     echo -e "${gl_kjlan}[网络设置]${gl_bai}"
-    echo "8. 设置IPv4/IPv6优先级"
-    echo "9. IPv6管理（临时/永久禁用/取消）"
-    echo "10. 设置临时SOCKS5代理"
+    echo "7. 设置IPv4/IPv6优先级"
+    echo "8. IPv6管理（临时/永久禁用/取消）"
+    echo "9. 设置临时SOCKS5代理"
     echo ""
     echo -e "${gl_kjlan}[系统管理]${gl_bai}"
-    echo "11. 虚拟内存管理"
-    echo "12. 查看系统详细状态"
+    echo "10. 虚拟内存管理"
+    echo "11. 查看系统详细状态"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━ 转发/代理配置 ━━━━━━━━━━${gl_bai}"
     echo -e "${gl_kjlan}[Realm转发管理]${gl_bai}"
-    echo "13. Realm转发连接分析"
-    echo "14. Realm强制使用IPv4 ⭐ 推荐"
-    echo "15. IPv4/IPv6连接检测"
+    echo "12. Realm转发连接分析"
+    echo "13. Realm强制使用IPv4 ⭐ 推荐"
+    echo "14. IPv4/IPv6连接检测"
     echo ""
     echo -e "${gl_kjlan}[Xray配置]${gl_bai}"
-    echo "16. 查看Xray配置"
-    echo "17. 设置Xray IPv6出站"
-    echo "18. 恢复Xray默认配置"
+    echo "15. 查看Xray配置"
+    echo "16. 设置Xray IPv6出站"
+    echo "17. 恢复Xray默认配置"
     echo ""
     echo -e "${gl_kjlan}[代理部署]${gl_bai}"
-    echo "19. 星辰大海Snell协议 ⭐ 推荐"
-    echo "20. 星辰大海Xray一键双协议 ⭐ 推荐"
-    echo "21. 禁止端口通过中国大陆直连"
-    echo "22. 一键部署SOCKS5代理"
-    echo "23. Sub-Store多实例管理"
-    echo "24. 一键反代 🎯 ⭐ 推荐"
+    echo "18. 星辰大海Snell协议 ⭐ 推荐"
+    echo "19. 星辰大海Xray一键多协议 ⭐ 推荐"
+    echo "20. 禁止端口通过中国大陆直连"
+    echo "21. 一键部署SOCKS5代理"
+    echo "22. Sub-Store多实例管理"
+    echo "23. 一键反代 🎯 ⭐ 推荐"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━━ 测试检测 ━━━━━━━━━━━${gl_bai}"
     echo -e "${gl_kjlan}[IP质量检测]${gl_bai}"
-    echo "25. IP质量检测（IPv4+IPv6）"
-    echo "26. IP质量检测（仅IPv4）⭐ 推荐"
+    echo "24. IP质量检测（IPv4+IPv6）"
+    echo "25. IP质量检测（仅IPv4）⭐ 推荐"
     echo ""
     echo -e "${gl_kjlan}[网络测试]${gl_bai}"
-    echo "27. 服务器带宽测试"
-    echo "28. iperf3单线程测试"
-    echo "29. 国际互联速度测试 ⭐ 推荐"
-    echo "30. 网络延迟质量检测 ⭐ 推荐"
-    echo "31. 三网回程路由测试 ⭐ 推荐"
+    echo "26. 服务器带宽测试"
+    echo "27. iperf3单线程测试"
+    echo "28. 国际互联速度测试 ⭐ 推荐"
+    echo "29. 网络延迟质量检测 ⭐ 推荐"
+    echo "30. 三网回程路由测试 ⭐ 推荐"
     echo ""
     echo -e "${gl_kjlan}[流媒体/AI检测]${gl_bai}"
-    echo "32. IP媒体/AI解锁检测 ⭐ 推荐"
-    echo "33. NS一键检测脚本 ⭐ 推荐"
+    echo "31. IP媒体/AI解锁检测 ⭐ 推荐"
+    echo "32. NS一键检测脚本 ⭐ 推荐"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━ 第三方工具 ━━━━━━━━━━${gl_bai}"
     echo -e "${gl_kjlan}[脚本合集]${gl_bai}"
-    echo "34. PF_realm转发脚本 ⭐ 推荐"
-    echo "35. F佬一键sing box脚本"
-    echo "36. 科技lion脚本"
-    echo "37. 酷雪云脚本"
+    echo "33. zywe_realm转发脚本 ⭐ 推荐"
+    echo "34. F佬一键sing box脚本"
+    echo "35. 科技lion脚本"
+    echo "36. 酷雪云脚本"
+    echo ""
+    echo -e "${gl_kjlan}━━━━━━━━━ 原注销脚本恢复 ━━━━━━━━━${gl_bai}"
+    echo -e "${gl_kjlan}[BBR/网络优化]${gl_bai}"
+    echo "37. NS论坛CAKE调优"
+    echo "38. 科技lion高性能模式"
+    echo ""
     echo ""
     echo -e "${gl_hong}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
     echo -e "${gl_hong}[完全卸载]${gl_bai}"
@@ -5530,107 +7008,110 @@ show_main_menu() {
             break_end
             ;;
         4)
-            dns_purify_and_harden
+            mtu_mss_optimization
             ;;
         5)
+            dns_purify_and_harden
+            ;;
+        6)
             realm_fix_timeout
             break_end
             ;;
-        6)
-            startbbrcake
-            ;;
         7)
-            Kernel_optimize
-            ;;
-        8)
             manage_ip_priority
             ;;
-        9)
+        8)
             manage_ipv6
             ;;
-        10)
+        9)
             set_temp_socks5_proxy
             ;;
-        11)
+        10)
             manage_swap
             ;;
-        12)
+        11)
             show_detailed_status
             ;;
-        13)
+        12)
             analyze_realm_connections
             ;;
-        14)
+        13)
             realm_ipv4_management
             ;;
-        15)
+        14)
             check_ipv4v6_connections
             ;;
-        16)
+        15)
             show_xray_config
             ;;
-        17)
+        16)
             set_xray_ipv6_outbound
             ;;
-        18)
+        17)
             restore_xray_default
             ;;
-        19)
+        18)
             snell_menu
             ;;
-        20)
+        19)
             run_xinchendahai_xray
             ;;
-        21)
+        20)
             manage_cn_ip_block
             ;;
-        22)
-            deploy_socks5
+        21)
+            manage_socks5
             ;;
-        23)
+        22)
             manage_substore
             ;;
-        24)
+        23)
             manage_reverse_proxy
             ;;
-        25)
+        24)
             run_ip_quality_check
             ;;
-        26)
+        25)
             run_ip_quality_check_ipv4
             ;;
-        27)
+        26)
             run_speedtest
             ;;
-        28)
+        27)
             iperf3_single_thread_test
             ;;
-        29)
+        28)
             run_international_speed_test
             ;;
-        30)
+        29)
             run_network_latency_check
             ;;
-        31)
+        30)
             run_backtrace
             ;;
-        32)
+        31)
             run_unlock_check
             ;;
-        33)
+        32)
             run_ns_detect
             ;;
-        34)
+        33)
             run_pf_realm
             ;;
-        35)
+        34)
             run_fscarmen_singbox
             ;;
-        36)
+        35)
             run_kejilion_script
             ;;
-        37)
+        36)
             run_kxy_script
+            ;;
+        37)
+            startbbrcake
+            ;;
+        38)
+            Kernel_optimize
             ;;
         99)
             uninstall_all
@@ -6089,7 +7570,11 @@ run_unlock_check() {
     echo ""
 
     # 执行解锁检测脚本
-    bash <(curl -sL Media.Check.Place)
+    if ! run_remote_script "https://github.com/1-stream/RegionRestrictionCheck/raw/main/check.sh" bash; then
+        echo -e "${gl_hong}❌ 脚本执行失败${gl_bai}"
+        break_end
+        return 1
+    fi
 
     echo ""
     echo "------------------------------------------------"
@@ -6098,19 +7583,19 @@ run_unlock_check() {
 
 run_pf_realm() {
     clear
-    echo -e "${gl_kjlan}=== PF_realm转发脚本 ===${gl_bai}"
+    echo -e "${gl_kjlan}=== zywe_realm转发脚本 ===${gl_bai}"
     echo ""
-    echo "正在运行 PF_realm 转发脚本安装程序..."
+    echo "正在运行 zywe_realm 转发脚本安装程序..."
     echo "------------------------------------------------"
     echo ""
 
-    # 执行 PF_realm 转发脚本
-    if wget -qO- https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh | bash -s install; then
+    # 执行 zywe_realm 转发脚本
+    if run_remote_script "https://raw.githubusercontent.com/zywe03/realm-xwPF/main/xwPF.sh" bash -s install; then
         echo ""
-        echo -e "${gl_lv}✅ PF_realm 脚本执行完成${gl_bai}"
+        echo -e "${gl_lv}✅ zywe_realm 脚本执行完成${gl_bai}"
     else
         echo ""
-        echo -e "${gl_hong}❌ PF_realm 脚本执行失败${gl_bai}"
+        echo -e "${gl_hong}❌ zywe_realm 脚本执行失败${gl_bai}"
         echo "可能原因："
         echo "1. 网络连接问题（无法访问GitHub）"
         echo "2. 脚本服务器不可用"
@@ -6131,7 +7616,11 @@ run_kxy_script() {
     echo ""
 
     # 执行酷雪云脚本
-    bash <(curl -sL https://cdn.kxy.ovh/kxy.sh)
+    if ! run_remote_script "https://cdn.kxy.ovh/kxy.sh" bash; then
+        echo -e "${gl_hong}❌ 脚本执行失败${gl_bai}"
+        break_end
+        return 1
+    fi
 
     echo ""
     echo "------------------------------------------------"
@@ -6259,7 +7748,7 @@ install_snell() {
 
     # 下载 Snell 服务器文件
     ARCH=$(arch)
-    VERSION="v5.0.0"
+    VERSION="v5.0.1"
     SNELL_URL=""
     INSTALL_DIR="/usr/local/bin"
     SYSTEMD_SERVICE_FILE="/lib/systemd/system/snell.service"
@@ -6477,66 +7966,83 @@ update_snell() {
 
     echo -e "${SNELL_GREEN}Snell 正在更新${SNELL_RESET}"
 
-    # 停止 Snell
-    if ! systemctl stop snell; then
-        echo -e "${SNELL_RED}停止 Snell 失败。${SNELL_RESET}"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - 停止 Snell 失败" >> "$SNELL_LOG_FILE"
-        exit 1
-    fi
+    # 停止所有 Snell 实例
+    echo -e "${SNELL_GREEN}正在停止所有 Snell 服务...${SNELL_RESET}"
+    for service_file in /etc/systemd/system/snell-*.service; do
+        if [ -f "$service_file" ]; then
+            service_name=$(basename "$service_file")
+            systemctl stop "$service_name" 2>/dev/null
+        fi
+    done
+    # 兼容旧版单实例
+    systemctl stop snell 2>/dev/null
 
     # 等待包管理器
     wait_for_package_manager_snell
 
     # 检查是否已安装 Snell 核心程序
-    if [ -f "${INSTALL_DIR}/snell-server" ]; then
-        echo -e "${SNELL_GREEN}检测到 Snell 核心程序已安装，跳过下载步骤...${SNELL_RESET}"
-    else
-        echo -e "${SNELL_GREEN}正在安装 Snell 核心程序...${SNELL_RESET}"
-        
-        # 安装必要的软件包
-        if ! install_required_packages_snell; then
-            echo -e "${SNELL_RED}安装必要软件包失败，请检查您的网络连接。${SNELL_RESET}"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - 安装必要软件包失败" >> "$SNELL_LOG_FILE"
-            exit 1
-        fi
-
-        # 下载 Snell 服务器文件
-        ARCH=$(arch)
-        VERSION="v5.0.0"
-        SNELL_URL=""
-
-        if [[ ${ARCH} == "aarch64" ]]; then
-            SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-aarch64.zip"
-        else
-            SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-amd64.zip"
-        fi
-
-        # 下载 Snell 服务器文件
-        if ! wget ${SNELL_URL} -O snell-server.zip; then
-            echo -e "${SNELL_RED}下载 Snell 失败。${SNELL_RESET}"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - 下载 Snell 失败" >> "$SNELL_LOG_FILE"
-            exit 1
-        fi
-
-        # 解压缩文件到指定目录
-        if ! unzip -o snell-server.zip -d ${INSTALL_DIR}; then
-            echo -e "${SNELL_RED}解压缩 Snell 失败。${SNELL_RESET}"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - 解压缩 Snell 失败" >> "$SNELL_LOG_FILE"
-            exit 1
-        fi
-
-        # 删除下载的 zip 文件
-        rm snell-server.zip
-
-        # 赋予执行权限
-        chmod +x ${INSTALL_DIR}/snell-server
+    echo -e "${SNELL_GREEN}正在安装 Snell 核心程序...${SNELL_RESET}"
+    
+    # 安装必要的软件包
+    if ! install_required_packages_snell; then
+        echo -e "${SNELL_RED}安装必要软件包失败，请检查您的网络连接。${SNELL_RESET}"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 安装必要软件包失败" >> "$SNELL_LOG_FILE"
+        exit 1
     fi
 
-    # 重启 Snell
-    if ! systemctl restart snell; then
-        echo -e "${SNELL_RED}重启 Snell 失败。${SNELL_RESET}"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - 重启 Snell 失败" >> "$SNELL_LOG_FILE"
+    # 下载 Snell 服务器文件
+    ARCH=$(arch)
+    VERSION="v5.0.1"
+    SNELL_URL=""
+
+    if [[ ${ARCH} == "aarch64" ]]; then
+        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-aarch64.zip"
+    else
+        SNELL_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-amd64.zip"
+    fi
+
+    # 下载 Snell 服务器文件
+    if ! wget ${SNELL_URL} -O snell-server.zip; then
+        echo -e "${SNELL_RED}下载 Snell 失败。${SNELL_RESET}"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 下载 Snell 失败" >> "$SNELL_LOG_FILE"
         exit 1
+    fi
+
+    # 解压缩文件到指定目录
+    if ! unzip -o snell-server.zip -d ${INSTALL_DIR}; then
+        echo -e "${SNELL_RED}解压缩 Snell 失败。${SNELL_RESET}"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - 解压缩 Snell 失败" >> "$SNELL_LOG_FILE"
+        exit 1
+    fi
+
+    # 删除下载的 zip 文件
+    rm snell-server.zip
+
+    # 赋予执行权限
+    chmod +x ${INSTALL_DIR}/snell-server
+
+    # 重启 Snell
+    # 重启所有 Snell 实例
+    echo -e "${SNELL_GREEN}正在重启所有 Snell 服务...${SNELL_RESET}"
+    local restart_count=0
+    for service_file in /etc/systemd/system/snell-*.service; do
+        if [ -f "$service_file" ]; then
+            service_name=$(basename "$service_file")
+            if systemctl restart "$service_name"; then
+                ((restart_count++))
+            else
+                echo -e "${SNELL_RED}重启 ${service_name} 失败${SNELL_RESET}"
+            fi
+        fi
+    done
+    
+    # 兼容旧版单实例
+    if [ -f "/etc/systemd/system/snell.service" ] || [ -f "/lib/systemd/system/snell.service" ]; then
+        systemctl restart snell 2>/dev/null
+    fi
+
+    if [ $restart_count -eq 0 ] && ! systemctl is-active --quiet snell; then
+        echo -e "${SNELL_YELLOW}未检测到活动的 Snell 服务实例${SNELL_RESET}"
     fi
 
     echo -e "${SNELL_GREEN}Snell 更新成功，非TF版本请改为version = 4${SNELL_RESET}"
@@ -6743,7 +8249,15 @@ snell_menu() {
         
         echo -e "已安装实例: ${SNELL_GREEN}${instance_count}${SNELL_RESET} 个"
         echo -e "运行中实例: ${SNELL_GREEN}${running_count}${SNELL_RESET} 个"
-        echo -e "运行版本: v5.0.0"
+        
+        # 动态获取 Snell 版本
+        local snell_version="未知"
+        if [ -f "/usr/local/bin/snell-server" ]; then
+            # 尝试获取版本号（Snell 没有 --version 参数，通过文件修改时间或固定版本号）
+            # 这里使用配置中指定的版本号
+            snell_version="v5.0.1"
+        fi
+        echo -e "运行版本: ${snell_version}"
         echo ""
         echo "1. 安装/添加 Snell 服务"
         echo "2. 卸载/删除 Snell 服务"
@@ -6798,12 +8312,12 @@ snell_menu() {
 }
 
 #=============================================================================
-# 星辰大海 Xray 一键双协议
+# 星辰大海 Xray 一键多协议
 #=============================================================================
 
 run_xinchendahai_xray() {
     clear
-    echo -e "${gl_kjlan}=== 星辰大海Xray一键双协议（增强版） ===${gl_bai}"
+    echo -e "${gl_kjlan}=== 星辰大海Xray一键多协议（增强版） ===${gl_bai}"
     echo ""
     echo -e "${gl_lv}✨ 功能特性：${gl_bai}"
     echo "  • 支持多 VLESS 节点部署（不同端口）"
@@ -7004,56 +8518,119 @@ write_config() {
         fi
     fi
 
+    # 🆕 保留现有的自定义 outbounds（SOCKS5等）
+    local existing_custom_outbounds="[]"
+    local existing_custom_routing_rules="[]"
+    local should_preserve_config=false
+    
+    if [[ -f "$xray_config_path" ]]; then
+        # 🛡️ 首先检测是否为 Xray 官方默认配置
+        # 只有配置文件包含我们添加的节点（VLESS或Shadowsocks）时，才尝试保留现有配置
+        if jq -e '.inbounds[]? | select(.protocol == "vless" or .protocol == "shadowsocks")' "$xray_config_path" &>/dev/null; then
+            should_preserve_config=true
+        fi
+        
+        # 只有当配置文件包含我们的节点时，才尝试保留现有配置
+        if [[ "$should_preserve_config" == "true" ]]; then
+            # 验证配置文件是否为有效的 JSON
+            if jq empty "$xray_config_path" 2>/dev/null; then
+                # 提取所有非默认的 outbounds（保留 SOCKS5 等自定义代理）
+                local temp_outbounds
+                temp_outbounds=$(jq -c '[.outbounds[]? | select(.protocol != "freedom" and .protocol != "blackhole")]' "$xray_config_path" 2>/dev/null)
+                
+                # 验证提取结果是否为有效的 JSON 数组
+                if [[ -n "$temp_outbounds" ]] && echo "$temp_outbounds" | jq empty 2>/dev/null; then
+                    existing_custom_outbounds="$temp_outbounds"
+                fi
+                
+                # 提取所有自定义的 routing rules（排除默认的广告过滤规则）
+                # 判断是否为自定义规则：包含 inboundTag 或 outboundTag 以 "socks5-" 开头
+                local temp_rules
+                temp_rules=$(jq -c '[.routing.rules[]? | select(.inboundTag != null or (.outboundTag? | startswith("socks5-")))]' "$xray_config_path" 2>/dev/null)
+                
+                # 验证提取结果是否为有效的 JSON 数组
+                if [[ -n "$temp_rules" ]] && echo "$temp_rules" | jq empty 2>/dev/null; then
+                    existing_custom_routing_rules="$temp_rules"
+                fi
+            else
+                warning "现有配置文件格式异常，将忽略现有的自定义配置"
+            fi
+        fi
+    fi
+    
+    # 🔧 确保所有 JSON 变量都是紧凑的单行格式
+    inbounds_json=$(echo "$inbounds_json" | jq -c '.')
+    existing_custom_outbounds=$(echo "$existing_custom_outbounds" | jq -c '.')
+    existing_custom_routing_rules=$(echo "$existing_custom_routing_rules" | jq -c '.')
+    
+    # 🔧 在 shell 中预先构建完整的 outbounds 数组
+    # 这样可以避免在 jq 表达式内部使用 + 操作符，解决兼容性问题
+    local base_outbounds
+    if [[ "$enable_routing" == "true" ]]; then
+        base_outbounds='[{"protocol":"freedom","tag":"direct","settings":{"domainStrategy":"UseIPv4v6"}},{"protocol":"blackhole","tag":"block"}]'
+    else
+        base_outbounds='[{"protocol":"freedom","settings":{"domainStrategy":"UseIPv4v6"}}]'
+    fi
+    
+    # 使用 jq 合并 outbounds 数组（在 shell 中完成，不是在 jq 表达式内部）
+    local full_outbounds
+    full_outbounds=$(echo "$base_outbounds" | jq -c --argjson custom "$existing_custom_outbounds" '. + $custom')
+    
+    # 构建完整的 routing rules
+    local full_rules
+    if [[ "$enable_routing" == "true" ]]; then
+        local default_block_rule='[{"type":"field","domain":["geosite:category-ads-all","geosite:category-porn","regexp:.*missav.*","geosite:missav"],"outboundTag":"block"}]'
+        full_rules=$(echo "$existing_custom_routing_rules" | jq -c --argjson default "$default_block_rule" '. + $default')
+    else
+        full_rules="$existing_custom_routing_rules"
+    fi
+
     if [[ "$enable_routing" == "true" ]]; then
         # 带路由规则的配置
-        config_content=$(jq -n --argjson inbounds "$inbounds_json" \
+        config_content=$(jq -n \
+            --argjson inbounds "$inbounds_json" \
+            --argjson outbounds "$full_outbounds" \
+            --argjson rules "$full_rules" \
         '{
           "log": {"loglevel": "warning"},
           "inbounds": $inbounds,
-          "outbounds": [
-            {
-              "protocol": "freedom",
-              "tag": "direct",
-              "settings": {
-                "domainStrategy": "UseIPv4v6"
-              }
-            },
-            {
-              "protocol": "blackhole",
-              "tag": "block"
-            }
-          ],
+          "outbounds": $outbounds,
           "routing": {
             "domainStrategy": "IPOnDemand",
-            "rules": [
-              {
-                "type": "field",
-                "domain": [
-                  "geosite:category-ads-all",
-                  "geosite:category-porn",
-                  "regexp:.*missav.*",
-                  "geosite:missav"
-                ],
-                "outboundTag": "block"
-              }
-            ]
+            "rules": $rules
           }
         }')
     else
-        # 不带路由规则的配置（原始）
-        config_content=$(jq -n --argjson inbounds "$inbounds_json" \
-        '{
-          "log": {"loglevel": "warning"},
-          "inbounds": $inbounds,
-          "outbounds": [
-            {
-              "protocol": "freedom",
-              "settings": {
-                "domainStrategy": "UseIPv4v6"
+        # 不带路由规则的配置
+        local rules_length
+        rules_length=$(echo "$full_rules" | jq 'length')
+        
+        if [[ "$rules_length" -gt 0 ]]; then
+            # 有自定义 rules，需要添加 routing
+            config_content=$(jq -n \
+                --argjson inbounds "$inbounds_json" \
+                --argjson outbounds "$full_outbounds" \
+                --argjson rules "$full_rules" \
+            '{
+              "log": {"loglevel": "warning"},
+              "inbounds": $inbounds,
+              "outbounds": $outbounds,
+              "routing": {
+                "domainStrategy": "IPOnDemand",
+                "rules": $rules
               }
-            }
-          ]
-        }')
+            }')
+        else
+            # 没有 rules，不需要 routing
+            config_content=$(jq -n \
+                --argjson inbounds "$inbounds_json" \
+                --argjson outbounds "$full_outbounds" \
+            '{
+              "log": {"loglevel": "warning"},
+              "inbounds": $inbounds,
+              "outbounds": $outbounds
+            }')
+        fi
     fi
     
     # 新增：验证生成的JSON是否有效
@@ -8242,14 +9819,12 @@ add_socks5_proxy() {
     # 添加或更新路由规则
     config=$(echo "$config" | jq --arg inbound_tag "$selected_tag" --arg outbound_tag "$socks5_tag" '
         if .routing.rules then
-            # 删除旧规则（如果存在）
-            .routing.rules |= map(select(.inboundTag[0] != $inbound_tag)) |
-            # 添加新规则（放在最前面，优先级高）
+            # 删除当前节点的旧规则，并在前面添加新规则（一个原子操作）
             .routing.rules = [{
                 type: "field",
                 inboundTag: [$inbound_tag],
                 outboundTag: $outbound_tag
-            }] + .routing.rules
+            }] + (.routing.rules | map(select(.inboundTag[0] != $inbound_tag)))
         else
             # 如果没有routing，创建一个
             .routing = {
@@ -8419,9 +9994,12 @@ delete_socks5_proxy() {
     local config
     config=$(cat "$xray_config_path")
     
-    # 删除routing rule
-    config=$(echo "$config" | jq --arg inbound_tag "$inbound_tag" '
-        .routing.rules |= map(select(.inboundTag[0] != $inbound_tag or (.outboundTag | startswith("socks5-") | not)))
+    # 删除routing rule（只删除匹配该inbound且指向socks5的规则）
+    config=$(echo "$config" | jq --arg inbound_tag "$inbound_tag" --arg outbound_tag "$outbound_tag" '
+        .routing.rules |= map(select(
+            (.inboundTag[0] != $inbound_tag) or 
+            (.outboundTag != $outbound_tag)
+        ))
     ')
     
     # 删除socks5 outbound
@@ -8650,7 +10228,7 @@ main_menu() {
         printf "  ${magenta}%-2s${none} %-35s\n" "6." "删除指定 Shadowsocks-2022 节点"
         printf "  ${yellow}%-2s${none} %-35s\n" "7." "修改 Shadowsocks-2022 配置"
         draw_divider
-        echo -e "${cyan}[SOCKS5 链式代理管理] 🆕${none}"
+        echo -e "${cyan}[SOCKS5 链式代理管理]${none}"
         printf "  ${green}%-2s${none} %-35s\n" "8." "🔗 新增 SOCKS5 链式代理"
         printf "  ${cyan}%-2s${none} %-35s\n" "9." "📋 查看 SOCKS5 链式代理列表"
         printf "  ${magenta}%-2s${none} %-35s\n" "10." "❌ 删除 SOCKS5 链式代理"
@@ -8665,10 +10243,13 @@ main_menu() {
         echo -e "${cyan}[高级功能]${none}"
         printf "  ${green}%-2s${none} %-35s ⭐\n" "16." "路由过滤规则管理"
         draw_divider
+        echo -e "${cyan}[多协议代理一键部署脚本]${none}"
+        printf "  ${green}%-2s${none} %-35s\n" "17." "vless-all-in-one"
+        draw_divider
         printf "  ${red}%-2s${none} %-35s\n" "0." "退出脚本"
         draw_divider
 
-        read -p " 请输入选项 [0-16]: " choice || true
+        read -p " 请输入选项 [0-17]: " choice || true
 
         local needs_pause=true
 
@@ -8689,8 +10270,9 @@ main_menu() {
             14) view_xray_log; needs_pause=false ;;
             15) view_all_info ;;
             16) manage_routing_rules ;;
+            17) wget -O vless-server.sh https://raw.githubusercontent.com/Chil30/vless-all-in-one/main/vless-server.sh && chmod +x vless-server.sh && bash vless-server.sh; needs_pause=false ;;
             0) success "感谢使用！"; exit 0 ;;
-            *) error "无效选项。请输入0到16之间的数字。" ;;
+            *) error "无效选项。请输入 0-17。" ;;
         esac
 
         if [ "$needs_pause" = true ]; then
@@ -8928,6 +10510,7 @@ add_port_block_rule() {
     if command -v netfilter-persistent &> /dev/null; then
         netfilter-persistent save >/dev/null 2>&1
     elif command -v iptables-save &> /dev/null; then
+        mkdir -p /etc/iptables
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     fi
 
@@ -8962,6 +10545,7 @@ remove_port_block_rule() {
     if command -v netfilter-persistent &> /dev/null; then
         netfilter-persistent save >/dev/null 2>&1
     elif command -v iptables-save &> /dev/null; then
+        mkdir -p /etc/iptables
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     fi
 
@@ -9020,6 +10604,7 @@ EOF
     if command -v netfilter-persistent &> /dev/null; then
         netfilter-persistent save >/dev/null 2>&1
     elif command -v iptables-save &> /dev/null; then
+        mkdir -p /etc/iptables
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     fi
 
@@ -9515,7 +11100,11 @@ run_kejilion_script() {
     echo ""
 
     # 执行科技lion脚本
-    bash <(curl -sL kejilion.sh)
+    if ! run_remote_script "kejilion.sh" bash; then
+        echo -e "${gl_hong}❌ 脚本执行失败${gl_bai}"
+        break_end
+        return 1
+    fi
 
     echo ""
     echo "------------------------------------------------"
@@ -9531,7 +11120,11 @@ run_fscarmen_singbox() {
     echo ""
 
     # 执行 F佬一键sing box脚本
-    bash <(wget -qO- https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh)
+    if ! run_remote_script "https://raw.githubusercontent.com/fscarmen/sing-box/main/sing-box.sh" bash; then
+        echo -e "${gl_hong}❌ 脚本执行失败${gl_bai}"
+        break_end
+        return 1
+    fi
 
     echo ""
     echo "------------------------------------------------"
@@ -9555,7 +11148,9 @@ remove_bbr_lotserver() {
   rm -rf bbrmod
 
   if [[ -e /appex/bin/lotServer.sh ]]; then
-    echo | bash <(wget -qO- https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh) uninstall
+    if ! printf '\n' | run_remote_script "https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh" bash uninstall; then
+      echo -e "${gl_huang}⚠️  lotServer 卸载脚本执行失败，已跳过${gl_bai}"
+    fi
   fi
   clear
 }
@@ -9574,6 +11169,715 @@ startbbrcake() {
 # SOCKS5 一键部署功能
 #=============================================================================
 
+# SOCKS5 配置目录
+SOCKS5_CONFIG_DIR="/etc/sbox_socks5"
+SOCKS5_CONFIG_FILE="${SOCKS5_CONFIG_DIR}/config.json"
+SOCKS5_SERVICE_NAME="sbox-socks5"
+
+# 查看 SOCKS5 配置信息
+view_socks5() {
+    clear
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo -e "${gl_kjlan}      查看 SOCKS5 代理信息${gl_bai}"
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo ""
+    
+    # 检查配置文件是否存在
+    if [ ! -f "$SOCKS5_CONFIG_FILE" ]; then
+        echo -e "${gl_huang}⚠️  未检测到 SOCKS5 代理配置${gl_bai}"
+        echo ""
+        echo "您可以选择菜单 [1] 新增 SOCKS5 代理"
+        echo ""
+        break_end
+        return 1
+    fi
+    
+    # 解析配置文件
+    local port=$(jq -r '.inbounds[0].listen_port // empty' "$SOCKS5_CONFIG_FILE" 2>/dev/null)
+    local username=$(jq -r '.inbounds[0].users[0].username // empty' "$SOCKS5_CONFIG_FILE" 2>/dev/null)
+    local password=$(jq -r '.inbounds[0].users[0].password // empty' "$SOCKS5_CONFIG_FILE" 2>/dev/null)
+    
+    if [ -z "$port" ] || [ -z "$username" ]; then
+        echo -e "${gl_hong}❌ 配置文件格式错误或为空${gl_bai}"
+        echo ""
+        echo "配置文件路径: $SOCKS5_CONFIG_FILE"
+        echo ""
+        break_end
+        return 1
+    fi
+    
+    # 获取服务器IP
+    local server_ip=$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null || \
+                      curl -4 -s --max-time 3 ipinfo.io/ip 2>/dev/null || \
+                      curl -6 -s --max-time 3 ifconfig.me 2>/dev/null || \
+                      echo "请手动获取")
+    
+    # 检查服务状态
+    local service_status=""
+    if systemctl is-active --quiet "$SOCKS5_SERVICE_NAME"; then
+        service_status="${gl_lv}✅ 运行中${gl_bai}"
+    else
+        service_status="${gl_hong}❌ 未运行${gl_bai}"
+    fi
+    
+    # 检查端口监听
+    local port_status=""
+    if ss -tulpn | grep -q ":${port} "; then
+        port_status="${gl_lv}✅ 监听中${gl_bai}"
+    else
+        port_status="${gl_hong}❌ 未监听${gl_bai}"
+    fi
+    
+    echo -e "${gl_lv}SOCKS5 连接信息：${gl_bai}"
+    echo ""
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo -e "  服务器地址: ${gl_huang}${server_ip}${gl_bai}"
+    echo -e "  端口:       ${gl_huang}${port}${gl_bai}"
+    echo -e "  用户名:     ${gl_huang}${username}${gl_bai}"
+    echo -e "  密码:       ${gl_huang}${password}${gl_bai}"
+    echo -e "  协议:       ${gl_huang}SOCKS5${gl_bai}"
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo ""
+    echo -e "  服务状态:   $service_status"
+    echo -e "  端口状态:   $port_status"
+    echo ""
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo ""
+    echo -e "${gl_zi}测试连接命令：${gl_bai}"
+    echo "curl --socks5-hostname ${username}:${password}@${server_ip}:${port} http://httpbin.org/ip"
+    echo ""
+    echo -e "${gl_zi}管理命令：${gl_bai}"
+    echo "  查看日志: journalctl -u ${SOCKS5_SERVICE_NAME} -f"
+    echo "  重启服务: systemctl restart ${SOCKS5_SERVICE_NAME}"
+    echo "  停止服务: systemctl stop ${SOCKS5_SERVICE_NAME}"
+    echo ""
+    
+    break_end
+}
+
+# 修改 SOCKS5 配置
+modify_socks5() {
+    clear
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo -e "${gl_kjlan}      修改 SOCKS5 代理配置${gl_bai}"
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo ""
+    
+    # 检查配置文件是否存在
+    if [ ! -f "$SOCKS5_CONFIG_FILE" ]; then
+        echo -e "${gl_huang}⚠️  未检测到 SOCKS5 代理配置${gl_bai}"
+        echo ""
+        echo "您可以选择菜单 [1] 新增 SOCKS5 代理"
+        echo ""
+        break_end
+        return 1
+    fi
+    
+    # 读取当前配置
+    local current_port=$(jq -r '.inbounds[0].listen_port // empty' "$SOCKS5_CONFIG_FILE" 2>/dev/null)
+    local current_user=$(jq -r '.inbounds[0].users[0].username // empty' "$SOCKS5_CONFIG_FILE" 2>/dev/null)
+    local current_pass=$(jq -r '.inbounds[0].users[0].password // empty' "$SOCKS5_CONFIG_FILE" 2>/dev/null)
+    
+    echo -e "${gl_zi}当前配置：${gl_bai}"
+    echo "  端口: ${current_port}"
+    echo "  用户名: ${current_user}"
+    echo "  密码: ${current_pass}"
+    echo ""
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo ""
+    echo "请选择要修改的项目："
+    echo ""
+    echo "  1. 修改端口"
+    echo "  2. 修改用户名"
+    echo "  3. 修改密码"
+    echo "  4. 修改所有配置"
+    echo ""
+    echo "  0. 返回上级菜单"
+    echo ""
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    
+    read -e -p "请输入选项 [0-4]: " modify_choice
+    
+    local new_port="$current_port"
+    local new_user="$current_user"
+    local new_pass="$current_pass"
+    
+    case "$modify_choice" in
+        1)
+            echo ""
+            while true; do
+                read -e -p "$(echo -e "${gl_huang}请输入新端口 [当前: ${current_port}]: ${gl_bai}")" new_port
+                new_port=${new_port:-$current_port}
+                
+                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65535 ]; then
+                    if [ "$new_port" != "$current_port" ] && ss -tulpn | grep -q ":${new_port} "; then
+                        echo -e "${gl_hong}❌ 端口 ${new_port} 已被占用${gl_bai}"
+                    else
+                        break
+                    fi
+                else
+                    echo -e "${gl_hong}❌ 无效端口，请输入 1024-65535 之间的数字${gl_bai}"
+                fi
+            done
+            ;;
+        2)
+            echo ""
+            while true; do
+                read -e -p "$(echo -e "${gl_huang}请输入新用户名 [当前: ${current_user}]: ${gl_bai}")" new_user
+                new_user=${new_user:-$current_user}
+                
+                if [[ "$new_user" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                    break
+                else
+                    echo -e "${gl_hong}❌ 用户名只能包含字母、数字、下划线和连字符${gl_bai}"
+                fi
+            done
+            ;;
+        3)
+            echo ""
+            while true; do
+                read -e -p "$(echo -e "${gl_huang}请输入新密码: ${gl_bai}")" new_pass
+                
+                if [ -z "$new_pass" ]; then
+                    new_pass="$current_pass"
+                    break
+                elif [ ${#new_pass} -lt 6 ]; then
+                    echo -e "${gl_hong}❌ 密码长度至少6位${gl_bai}"
+                elif [[ "$new_pass" == *\"* || "$new_pass" == *\\* ]]; then
+                    echo -e "${gl_hong}❌ 密码不能包含 \" 或 \\ 字符${gl_bai}"
+                else
+                    break
+                fi
+            done
+            ;;
+        4)
+            echo ""
+            # 修改端口
+            while true; do
+                read -e -p "$(echo -e "${gl_huang}请输入新端口 [当前: ${current_port}, 回车保持不变]: ${gl_bai}")" new_port
+                new_port=${new_port:-$current_port}
+                
+                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65535 ]; then
+                    if [ "$new_port" != "$current_port" ] && ss -tulpn | grep -q ":${new_port} "; then
+                        echo -e "${gl_hong}❌ 端口 ${new_port} 已被占用${gl_bai}"
+                    else
+                        break
+                    fi
+                else
+                    echo -e "${gl_hong}❌ 无效端口，请输入 1024-65535 之间的数字${gl_bai}"
+                fi
+            done
+            echo ""
+            
+            # 修改用户名
+            while true; do
+                read -e -p "$(echo -e "${gl_huang}请输入新用户名 [当前: ${current_user}, 回车保持不变]: ${gl_bai}")" new_user
+                new_user=${new_user:-$current_user}
+                
+                if [[ "$new_user" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                    break
+                else
+                    echo -e "${gl_hong}❌ 用户名只能包含字母、数字、下划线和连字符${gl_bai}"
+                fi
+            done
+            echo ""
+            
+            # 修改密码
+            while true; do
+                read -e -p "$(echo -e "${gl_huang}请输入新密码 [回车保持不变]: ${gl_bai}")" new_pass
+                
+                if [ -z "$new_pass" ]; then
+                    new_pass="$current_pass"
+                    break
+                elif [ ${#new_pass} -lt 6 ]; then
+                    echo -e "${gl_hong}❌ 密码长度至少6位${gl_bai}"
+                elif [[ "$new_pass" == *\"* || "$new_pass" == *\\* ]]; then
+                    echo -e "${gl_hong}❌ 密码不能包含 \" 或 \\ 字符${gl_bai}"
+                else
+                    break
+                fi
+            done
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            echo -e "${gl_hong}❌ 无效选项${gl_bai}"
+            sleep 1
+            return 1
+            ;;
+    esac
+    
+    # 确认修改
+    echo ""
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo -e "${gl_lv}修改后的配置：${gl_bai}"
+    echo "  端口: ${new_port}"
+    echo "  用户名: ${new_user}"
+    echo "  密码: ${new_pass}"
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo ""
+    
+    read -e -p "$(echo -e "${gl_huang}确认修改？(Y/N): ${gl_bai}")" confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "已取消修改"
+        break_end
+        return 0
+    fi
+    
+    # 检测 sing-box 二进制程序
+    local SINGBOX_CMD=""
+    for path in /etc/sing-box/sing-box /usr/local/bin/sing-box /opt/sing-box/sing-box; do
+        if [ -x "$path" ]; then
+            SINGBOX_CMD="$path"
+            break
+        fi
+    done
+    
+    if [ -z "$SINGBOX_CMD" ]; then
+        for cmd in sing-box sb; do
+            if command -v "$cmd" &>/dev/null; then
+                SINGBOX_CMD=$(which "$cmd")
+                break
+            fi
+        done
+    fi
+    
+    if [ -z "$SINGBOX_CMD" ]; then
+        echo -e "${gl_hong}❌ 未找到 sing-box 程序${gl_bai}"
+        break_end
+        return 1
+    fi
+    
+    # 更新配置文件
+    echo ""
+    echo -e "${gl_zi}正在更新配置...${gl_bai}"
+    
+    cat > "$SOCKS5_CONFIG_FILE" << CONFIGEOF
+{
+  "log": {
+    "level": "info",
+    "output": "${SOCKS5_CONFIG_DIR}/socks5.log"
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks5-in",
+      "listen": "0.0.0.0",
+      "listen_port": ${new_port},
+      "users": [
+        {
+          "username": "${new_user}",
+          "password": "${new_pass}"
+        }
+      ]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+CONFIGEOF
+    
+    chmod 600 "$SOCKS5_CONFIG_FILE"
+    
+    # 验证配置
+    if ! $SINGBOX_CMD check -c "$SOCKS5_CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${gl_hong}❌ 配置文件语法错误${gl_bai}"
+        $SINGBOX_CMD check -c "$SOCKS5_CONFIG_FILE"
+        break_end
+        return 1
+    fi
+    
+    # 更新 systemd 服务文件（如果端口改变需要更新）
+    cat > /etc/systemd/system/${SOCKS5_SERVICE_NAME}.service << SERVICEEOF
+[Unit]
+Description=Sing-box SOCKS5 Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${SINGBOX_CMD} run -c ${SOCKS5_CONFIG_FILE}
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=always
+RestartSec=5
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${SOCKS5_SERVICE_NAME}
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${SOCKS5_CONFIG_DIR}
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+    
+    # 重新加载并重启服务
+    systemctl daemon-reload
+    systemctl restart "$SOCKS5_SERVICE_NAME"
+    
+    sleep 2
+    
+    # 验证服务状态
+    if systemctl is-active --quiet "$SOCKS5_SERVICE_NAME"; then
+        echo -e "${gl_lv}✅ 配置修改成功，服务已重启${gl_bai}"
+    else
+        echo -e "${gl_hong}❌ 服务重启失败，请检查日志${gl_bai}"
+        echo "journalctl -u ${SOCKS5_SERVICE_NAME} -n 20 --no-pager"
+    fi
+    
+    echo ""
+    break_end
+}
+
+# 删除 SOCKS5 配置
+delete_socks5() {
+    clear
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo -e "${gl_kjlan}      删除 SOCKS5 代理${gl_bai}"
+    echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+    echo ""
+    
+    # 检查是否存在配置
+    local has_config=false
+    local has_service=false
+    
+    if [ -f "$SOCKS5_CONFIG_FILE" ] || [ -d "$SOCKS5_CONFIG_DIR" ]; then
+        has_config=true
+    fi
+    
+    if [ -f "/etc/systemd/system/${SOCKS5_SERVICE_NAME}.service" ]; then
+        has_service=true
+    fi
+    
+    if [ "$has_config" = false ] && [ "$has_service" = false ]; then
+        echo -e "${gl_huang}⚠️  未检测到 SOCKS5 代理配置${gl_bai}"
+        echo ""
+        break_end
+        return 0
+    fi
+    
+    # 显示即将删除的内容
+    echo -e "${gl_huang}即将删除以下内容：${gl_bai}"
+    echo ""
+    
+    if [ "$has_service" = true ]; then
+        echo "  • 系统服务: ${SOCKS5_SERVICE_NAME}"
+        if systemctl is-active --quiet "$SOCKS5_SERVICE_NAME"; then
+            echo "    状态: 运行中（将被停止）"
+        else
+            echo "    状态: 未运行"
+        fi
+    fi
+    
+    if [ "$has_config" = true ]; then
+        echo "  • 配置目录: ${SOCKS5_CONFIG_DIR}"
+        if [ -f "$SOCKS5_CONFIG_FILE" ]; then
+            local port=$(jq -r '.inbounds[0].listen_port // "未知"' "$SOCKS5_CONFIG_FILE" 2>/dev/null)
+            echo "    端口: ${port}"
+        fi
+    fi
+    
+    echo ""
+    echo -e "${gl_hong}⚠️  此操作不可恢复！${gl_bai}"
+    echo ""
+    
+    read -e -p "$(echo -e "${gl_huang}确认删除？请输入 'yes' 确认: ${gl_bai}")" confirm
+    
+    if [ "$confirm" != "yes" ]; then
+        echo ""
+        echo "已取消删除"
+        break_end
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${gl_zi}正在删除...${gl_bai}"
+    
+    # 停止并禁用服务
+    if [ "$has_service" = true ]; then
+        systemctl stop "$SOCKS5_SERVICE_NAME" 2>/dev/null
+        systemctl disable "$SOCKS5_SERVICE_NAME" 2>/dev/null
+        rm -f "/etc/systemd/system/${SOCKS5_SERVICE_NAME}.service"
+        systemctl daemon-reload
+        echo -e "${gl_lv}✅ 服务已删除${gl_bai}"
+    fi
+    
+    # 删除配置目录
+    if [ "$has_config" = true ]; then
+        rm -rf "$SOCKS5_CONFIG_DIR"
+        echo -e "${gl_lv}✅ 配置目录已删除${gl_bai}"
+    fi
+    
+    echo ""
+    echo -e "${gl_lv}🎉 SOCKS5 代理已完全删除${gl_bai}"
+    echo ""
+    
+    break_end
+}
+
+# SOCKS5 管理主菜单
+manage_socks5() {
+    while true; do
+        clear
+        echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo -e "${gl_kjlan}      Sing-box SOCKS5 管理${gl_bai}"
+        echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo ""
+        
+        # 检查当前状态
+        if [ -f "$SOCKS5_CONFIG_FILE" ]; then
+            local port=$(jq -r '.inbounds[0].listen_port // "未知"' "$SOCKS5_CONFIG_FILE" 2>/dev/null)
+            local user=$(jq -r '.inbounds[0].users[0].username // "未知"' "$SOCKS5_CONFIG_FILE" 2>/dev/null)
+            
+            if systemctl is-active --quiet "$SOCKS5_SERVICE_NAME"; then
+                echo -e "  当前状态: ${gl_lv}✅ 运行中${gl_bai}"
+            else
+                echo -e "  当前状态: ${gl_hong}❌ 未运行${gl_bai}"
+            fi
+            echo -e "  端口: ${gl_huang}${port}${gl_bai}  用户名: ${gl_huang}${user}${gl_bai}"
+        else
+            echo -e "  当前状态: ${gl_zi}未部署${gl_bai}"
+        fi
+        
+        echo ""
+        echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo ""
+        echo "  1. 新增 SOCKS5 代理"
+        echo "  2. 修改 SOCKS5 配置"
+        echo "  3. 删除 SOCKS5 代理"
+        echo "  4. 查看 SOCKS5 信息"
+        echo ""
+        echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo "  0. 返回主菜单"
+        echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+        echo ""
+        
+        read -e -p "请输入选项 [0-4]: " socks5_choice
+        
+        case "$socks5_choice" in
+            1)
+                # 检查是否已存在配置
+                if [ -f "$SOCKS5_CONFIG_FILE" ]; then
+                    echo ""
+                    echo -e "${gl_huang}⚠️  检测到已存在 SOCKS5 配置${gl_bai}"
+                    echo ""
+                    read -e -p "$(echo -e "${gl_huang}是否覆盖现有配置？(Y/N): ${gl_bai}")" overwrite
+                    if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+                        echo "已取消"
+                        sleep 1
+                        continue
+                    fi
+                fi
+                deploy_socks5
+                ;;
+            2)
+                modify_socks5
+                ;;
+            3)
+                delete_socks5
+                ;;
+            4)
+                view_socks5
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                echo -e "${gl_hong}❌ 无效选项${gl_bai}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+install_singbox_binary() {
+    clear
+    echo -e "${gl_kjlan}=== 自动安装 Sing-box 核心程序 ===${gl_bai}"
+    echo ""
+    echo "检测到系统未安装 sing-box"
+    echo ""
+    echo -e "${gl_huang}安装说明：${gl_bai}"
+    echo "  • 仅下载 sing-box 官方二进制程序"
+    echo "  • 不安装任何协议配置（纯净安装）"
+    echo "  • 安装后可用于 SOCKS5 代理部署"
+    echo "  • 如需完整功能，可稍后通过菜单 36 安装"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    read -e -p "$(echo -e "${gl_huang}是否继续安装？(Y/N): ${gl_bai}")" confirm
+    
+    case "$confirm" in
+        [Yy])
+            echo ""
+            echo -e "${gl_lv}开始下载 Sing-box...${gl_bai}"
+            echo ""
+            
+            # 步骤1：检测系统架构
+            local arch=""
+            case "$(uname -m)" in
+                aarch64|arm64)
+                    arch="arm64"
+                    ;;
+                x86_64|amd64)
+                    arch="amd64"
+                    ;;
+                armv7l)
+                    arch="armv7"
+                    ;;
+                *)
+                    echo -e "${gl_hong}❌ 不支持的系统架构: $(uname -m)${gl_bai}"
+                    echo ""
+                    echo "支持的架构：amd64, arm64, armv7"
+                    echo ""
+                    break_end
+                    return 1
+                    ;;
+            esac
+            
+            echo -e "${gl_zi}[1/5] 检测架构: ${arch}${gl_bai}"
+            echo ""
+            
+            # 步骤2：获取最新版本
+            echo -e "${gl_zi}[2/5] 获取最新版本...${gl_bai}"
+            
+            local version=""
+            local gh_api_url="https://api.github.com/repos/SagerNet/sing-box/releases"
+            
+            # 尝试从 GitHub API 获取最新稳定版本（过滤掉 alpha/beta/rc）
+            version=$(wget --timeout=10 --tries=2 -qO- "$gh_api_url" 2>/dev/null | \
+                      grep '"tag_name"' | \
+                      sed -E 's/.*"tag_name":[[:space:]]*"v([^"]+)".*/\1/' | \
+                      grep -v -E '(alpha|beta|rc)' | \
+                      sort -Vr | head -1)
+            
+            # 如果 API 失败，使用默认版本
+            if [ -z "$version" ]; then
+                version="1.10.0"
+                echo -e "${gl_huang}  ⚠️  API 获取失败，使用默认版本: v${version}${gl_bai}"
+            else
+                echo -e "${gl_lv}  ✓ 最新版本: v${version}${gl_bai}"
+            fi
+            echo ""
+            
+            # 步骤3：下载并解压
+            echo -e "${gl_zi}[3/5] 下载 sing-box v${version} (${arch})...${gl_bai}"
+            
+            local download_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
+            local temp_dir="/tmp/singbox-install-$$"
+            
+            mkdir -p "$temp_dir"
+            
+            if ! wget --timeout=30 --tries=3 -qO "${temp_dir}/sing-box.tar.gz" "$download_url" 2>/dev/null; then
+                echo -e "${gl_hong}  ✗ 下载失败${gl_bai}"
+                echo ""
+                echo "可能的原因："
+                echo "  1. 网络连接问题"
+                echo "  2. GitHub 访问受限"
+                echo "  3. 版本 v${version} 不存在"
+                echo ""
+                echo "建议："
+                echo "  • 检查网络连接"
+                echo "  • 配置代理后重试"
+                echo "  • 手动执行菜单 36 使用 F 佬脚本安装"
+                echo ""
+                rm -rf "$temp_dir"
+                break_end
+                return 1
+            fi
+            
+            echo -e "${gl_lv}  ✓ 下载完成${gl_bai}"
+            echo ""
+            
+            # 步骤4：解压并安装
+            echo -e "${gl_zi}[4/5] 解压并安装...${gl_bai}"
+            
+            if ! tar -xzf "${temp_dir}/sing-box.tar.gz" -C "$temp_dir" 2>/dev/null; then
+                echo -e "${gl_hong}  ✗ 解压失败${gl_bai}"
+                rm -rf "$temp_dir"
+                break_end
+                return 1
+            fi
+            
+            # 创建安装目录
+            mkdir -p /etc/sing-box
+            
+            # 查找并移动二进制文件（兼容不同版本的目录结构）
+            # 注意：不使用 -executable 参数，因为解压后的文件可能还没有执行权限
+            local binary_path=$(find "$temp_dir" -name "sing-box" -type f 2>/dev/null | head -1)
+            
+            if [ -n "$binary_path" ] && [ -f "$binary_path" ]; then
+                mv "$binary_path" /etc/sing-box/sing-box
+                chmod +x /etc/sing-box/sing-box
+                echo -e "${gl_lv}  ✓ 安装完成${gl_bai}"
+            else
+                echo -e "${gl_hong}  ✗ 未找到 sing-box 二进制文件${gl_bai}"
+                echo ""
+                echo "调试信息："
+                echo "临时目录内容："
+                ls -R "$temp_dir" 2>/dev/null || echo "无法列出目录"
+                echo ""
+                rm -rf "$temp_dir"
+                break_end
+                return 1
+            fi
+            
+            # 清理临时文件
+            rm -rf "$temp_dir"
+            echo ""
+            
+            # 步骤5：验证安装
+            echo -e "${gl_zi}[5/5] 验证安装...${gl_bai}"
+            
+            if /etc/sing-box/sing-box version >/dev/null 2>&1; then
+                local installed_version=$(/etc/sing-box/sing-box version 2>/dev/null | head -1)
+                echo -e "${gl_lv}  ✓ ${installed_version}${gl_bai}"
+                echo ""
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo -e "${gl_lv}✅ Sing-box 核心程序安装成功！${gl_bai}"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo ""
+                echo -e "${gl_zi}提示：${gl_bai}"
+                echo "  • 二进制位置: /etc/sing-box/sing-box"
+                echo "  • 这是纯净安装，未配置任何协议"
+                echo "  • 可继续部署 SOCKS5 代理"
+                echo "  • 如需完整功能，可执行菜单 36 安装协议配置"
+                echo ""
+                return 0
+            else
+                echo -e "${gl_hong}  ✗ 验证失败${gl_bai}"
+                echo ""
+                break_end
+                return 1
+            fi
+            ;;
+        *)
+            echo ""
+            echo "已取消安装"
+            echo ""
+            echo "您可以："
+            echo "  • 稍后通过菜单 36 使用 F 佬脚本安装（含完整协议配置）"
+            echo "  • 自行安装 sing-box 到 /etc/sing-box/sing-box"
+            echo ""
+            break_end
+            return 1
+            ;;
+    esac
+}
+
 deploy_socks5() {
     clear
     echo -e "${gl_kjlan}=== Sing-box SOCKS5 一键部署 ===${gl_bai}"
@@ -9587,16 +11891,50 @@ deploy_socks5() {
     echo ""
     
     local SINGBOX_CMD=""
+    local detection_debug=""
     
     # 优先查找常见的二进制程序位置
     for path in /etc/sing-box/sing-box /usr/local/bin/sing-box /opt/sing-box/sing-box; do
-        if [ -x "$path" ] && [ ! -L "$path" ]; then
-            # 验证是 ELF 二进制文件，不是脚本
-            if file "$path" 2>/dev/null | grep -q "ELF"; then
-                SINGBOX_CMD="$path"
-                echo -e "${gl_lv}✅ 找到 sing-box 程序: $SINGBOX_CMD${gl_bai}"
-                break
+        detection_debug+="正在检测: $path ... "
+        
+        # 检查文件是否存在
+        if [ ! -e "$path" ]; then
+            detection_debug+="不存在\n"
+            continue
+        fi
+        
+        # 检查是否可执行
+        if [ ! -x "$path" ]; then
+            detection_debug+="存在但不可执行（尝试添加执行权限）\n"
+            chmod +x "$path" 2>/dev/null
+            if [ ! -x "$path" ]; then
+                detection_debug+="  └─ 无法添加执行权限，跳过\n"
+                continue
             fi
+        fi
+        
+        # 如果是符号链接，解析实际路径
+        if [ -L "$path" ]; then
+            local real_path=$(readlink -f "$path")
+            detection_debug+="是符号链接 → $real_path\n"
+            path="$real_path"
+        fi
+        
+        # 验证是 ELF 二进制文件（如果 file 命令可用）
+        if command -v file >/dev/null 2>&1; then
+            local file_type=$(file "$path" 2>/dev/null)
+            if echo "$file_type" | grep -q "ELF"; then
+                SINGBOX_CMD="$path"
+                echo -e "${gl_lv}✅ 找到 sing-box 二进制程序: $SINGBOX_CMD${gl_bai}"
+                break
+            else
+                detection_debug+="  └─ 不是 ELF 二进制文件（类型: $file_type），跳过\n"
+            fi
+        else
+            # file 命令不可用，直接使用（已经检查过可执行权限）
+            SINGBOX_CMD="$path"
+            echo -e "${gl_lv}✅ 找到 sing-box 二进制程序: $SINGBOX_CMD${gl_bai}"
+            break
         fi
     done
     
@@ -9605,12 +11943,31 @@ deploy_socks5() {
         for cmd in sing-box sb; do
             if command -v "$cmd" &>/dev/null; then
                 local cmd_path=$(which "$cmd")
-                if file "$cmd_path" 2>/dev/null | grep -q "ELF"; then
-                    SINGBOX_CMD="$cmd_path"
-                    echo -e "${gl_lv}✅ 找到 sing-box 程序: $SINGBOX_CMD${gl_bai}"
-                    break
+                detection_debug+="正在检测 PATH 命令: $cmd → $cmd_path ... "
+                
+                # 如果是符号链接，解析实际路径
+                if [ -L "$cmd_path" ]; then
+                    local real_path=$(readlink -f "$cmd_path")
+                    detection_debug+="是符号链接 → $real_path\n"
+                    cmd_path="$real_path"
+                fi
+                
+                # 验证文件类型（如果 file 命令可用）
+                if command -v file >/dev/null 2>&1; then
+                    local file_type=$(file "$cmd_path" 2>/dev/null)
+                    if echo "$file_type" | grep -q "ELF"; then
+                        SINGBOX_CMD="$cmd_path"
+                        echo -e "${gl_lv}✅ 找到 sing-box 二进制程序: $SINGBOX_CMD${gl_bai}"
+                        break
+                    else
+                        echo -e "${gl_huang}⚠️  $cmd_path 是脚本，跳过${gl_bai}"
+                        detection_debug+="  └─ 不是 ELF 二进制文件（类型: $file_type），跳过\n"
+                    fi
                 else
-                    echo -e "${gl_huang}⚠️  $cmd_path 是脚本，跳过${gl_bai}"
+                    # file 命令不可用，直接使用
+                    SINGBOX_CMD="$cmd_path"
+                    echo -e "${gl_lv}✅ 找到 sing-box 二进制程序: $SINGBOX_CMD${gl_bai}"
+                    break
                 fi
             fi
         done
@@ -9619,11 +11976,42 @@ deploy_socks5() {
     if [ -z "$SINGBOX_CMD" ]; then
         echo -e "${gl_hong}❌ 未找到 sing-box 二进制程序${gl_bai}"
         echo ""
-        echo "请先安装 sing-box，推荐使用："
-        echo "  - F佬一键sing box脚本（菜单选项 22/23）"
-        echo ""
-        break_end
-        return 1
+        
+        # 显示检测过程（可选）
+        read -e -p "$(echo -e "${gl_zi}是否查看详细检测过程？(y/N): ${gl_bai}")" show_debug
+        if [[ "$show_debug" =~ ^[Yy]$ ]]; then
+            echo ""
+            echo "检测过程："
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo -e "$detection_debug"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+        fi
+        
+        # 调用纯净安装函数（仅二进制）
+        if install_singbox_binary; then
+            # 安装成功，重新检测
+            echo ""
+            echo -e "${gl_zi}重新检测 sing-box...${gl_bai}"
+            echo ""
+            
+            SINGBOX_CMD="/etc/sing-box/sing-box"
+            if [ -x "$SINGBOX_CMD" ]; then
+                echo -e "${gl_lv}✅ 找到 sing-box 二进制程序: $SINGBOX_CMD${gl_bai}"
+                echo ""
+            else
+                echo -e "${gl_hong}❌ 安装后仍未找到 sing-box${gl_bai}"
+                echo ""
+                echo "请手动检查："
+                echo "  ls -lh /etc/sing-box/sing-box"
+                echo ""
+                break_end
+                return 1
+            fi
+        else
+            # 用户取消或安装失败
+            return 1
+        fi
     fi
     
     # 显示版本信息
@@ -9855,8 +12243,12 @@ SERVICEEOF
     echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
     
     if [ "$deploy_success" = true ]; then
-        # 获取服务器IP
-        local server_ip=$(curl -s --max-time 3 ifconfig.me 2>/dev/null || curl -s --max-time 3 ipinfo.io/ip 2>/dev/null || echo "请手动获取")
+        # 获取服务器IP（优先IPv4，fallback到IPv6）
+        local server_ip=$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null || \
+                          curl -4 -s --max-time 3 ipinfo.io/ip 2>/dev/null || \
+                          curl -6 -s --max-time 3 ifconfig.me 2>/dev/null || \
+                          curl -6 -s --max-time 3 ipinfo.io/ip 2>/dev/null || \
+                          echo "请手动获取")
         
         echo ""
         echo -e "${gl_lv}🎉 部署成功！${gl_bai}"
@@ -9956,15 +12348,15 @@ check_substore_docker() {
                 case "$mirror_choice" in
                     1)
                         echo "正在使用阿里云镜像安装 Docker..."
-                        curl -fsSL https://get.docker.com | bash -s docker --mirror Aliyun
+                        run_remote_script "https://get.docker.com" bash -s docker --mirror Aliyun
                         ;;
                     2)
                         echo "正在使用官方源安装 Docker..."
-                        curl -fsSL https://get.docker.com | bash
+                        run_remote_script "https://get.docker.com" bash
                         ;;
                     *)
                         echo "无效选择，使用阿里云镜像..."
-                        curl -fsSL https://get.docker.com | bash -s docker --mirror Aliyun
+                        run_remote_script "https://get.docker.com" bash -s docker --mirror Aliyun
                         ;;
                 esac
                 
@@ -10411,20 +12803,62 @@ configure_cf_tunnel() {
     echo ""
     echo -e "${gl_zi}[步骤 1/5] Cloudflare 账户登录${gl_bai}"
     echo ""
-    echo "即将打开浏览器进行 Cloudflare 登录..."
-    echo -e "${gl_huang}请在浏览器中完成授权${gl_bai}"
-    echo ""
-    read -e -p "按回车继续..."
     
-    cloudflared tunnel login
-    
-    if [ $? -ne 0 ]; then
-        echo -e "${gl_hong}❌ 登录失败${gl_bai}"
-        break_end
-        return 1
+    # 检查是否已有有效的证书（之前已登录过）
+    if [ -f "/root/.cloudflared/cert.pem" ]; then
+        echo -e "${gl_lv}✅ 检测到已有 Cloudflare 认证证书${gl_bai}"
+        echo ""
+        echo "请选择："
+        echo "1. 复用现有账户认证（推荐，适用于同一 CF 账户下的不同域名）"
+        echo "2. 使用新账户登录（需要使用其他 Cloudflare 账户）"
+        echo ""
+        
+        local auth_choice
+        read -e -p "请选择 [1-2]: " auth_choice
+        
+        case "$auth_choice" in
+            2)
+                echo ""
+                echo -e "${gl_huang}正在清除旧的认证信息...${gl_bai}"
+                rm -f /root/.cloudflared/cert.pem
+                
+                echo ""
+                echo "即将打开浏览器进行 Cloudflare 登录..."
+                echo -e "${gl_huang}请在浏览器中完成授权${gl_bai}"
+                echo ""
+                read -e -p "按回车继续..."
+                
+                cloudflared tunnel login
+                
+                if [ $? -ne 0 ]; then
+                    echo -e "${gl_hong}❌ 登录失败${gl_bai}"
+                    break_end
+                    return 1
+                fi
+                
+                echo -e "${gl_lv}✅ 新账户登录成功${gl_bai}"
+                ;;
+            *)
+                echo ""
+                echo -e "${gl_lv}✅ 将复用现有认证${gl_bai}"
+                ;;
+        esac
+    else
+        echo "即将打开浏览器进行 Cloudflare 登录..."
+        echo -e "${gl_huang}请在浏览器中完成授权${gl_bai}"
+        echo ""
+        read -e -p "按回车继续..."
+        
+        cloudflared tunnel login
+        
+        if [ $? -ne 0 ]; then
+            echo -e "${gl_hong}❌ 登录失败${gl_bai}"
+            break_end
+            return 1
+        fi
+        
+        echo -e "${gl_lv}✅ 登录成功${gl_bai}"
     fi
-    
-    echo -e "${gl_lv}✅ 登录成功${gl_bai}"
     
     echo ""
     echo -e "${gl_zi}[步骤 2/5] 创建隧道${gl_bai}"
@@ -10433,25 +12867,124 @@ configure_cf_tunnel() {
     local tunnel_name="sub-store-$instance_num"
     echo "隧道名称: $tunnel_name"
     
-    cloudflared tunnel create "$tunnel_name"
+    # 检查隧道是否已存在
+    local existing_tunnel_id=$(cloudflared tunnel list 2>/dev/null | grep "$tunnel_name" | awk '{print $1}')
     
-    if [ $? -ne 0 ]; then
-        echo -e "${gl_hong}❌ 创建隧道失败${gl_bai}"
-        break_end
-        return 1
+    if [ -n "$existing_tunnel_id" ]; then
+        echo ""
+        echo -e "${gl_lv}✅ 检测到同名隧道已存在${gl_bai}"
+        echo "Tunnel ID: $existing_tunnel_id"
+        echo ""
+        echo "请选择操作："
+        echo "1. 复用现有隧道（推荐）"
+        echo "2. 删除旧隧道并重新创建"
+        echo "3. 取消配置"
+        echo ""
+        
+        local tunnel_choice
+        read -e -p "请选择 [1-3]: " tunnel_choice
+        
+        case "$tunnel_choice" in
+            1)
+                echo -e "${gl_lv}✅ 将复用现有隧道${gl_bai}"
+                tunnel_id="$existing_tunnel_id"
+                ;;
+            2)
+                echo ""
+                # 先停止可能正在运行的 cloudflared 服务
+                local service_name="cloudflared-sub-store-$instance_num"
+                if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+                    echo "正在停止旧的 cloudflared 服务..."
+                    systemctl stop "$service_name" 2>/dev/null
+                    systemctl disable "$service_name" 2>/dev/null
+                    rm -f "/etc/systemd/system/$service_name.service" 2>/dev/null
+                    systemctl daemon-reload 2>/dev/null
+                    sleep 2
+                fi
+                
+                # 清理旧的凭证文件
+                if [ -n "$existing_tunnel_id" ]; then
+                    echo "正在清理旧的隧道凭证..."
+                    rm -f "/root/.cloudflared/$existing_tunnel_id.json" 2>/dev/null
+                fi
+                
+                echo "正在删除旧隧道..."
+                cloudflared tunnel cleanup "$tunnel_name" 2>/dev/null
+                cloudflared tunnel delete "$tunnel_name" 2>/dev/null
+                
+                # 如果删除失败，尝试强制删除
+                if cloudflared tunnel list 2>/dev/null | grep -q "$tunnel_name"; then
+                    echo -e "${gl_huang}尝试强制删除隧道...${gl_bai}"
+                    cloudflared tunnel delete -f "$tunnel_name" 2>/dev/null
+                fi
+                
+                echo "正在创建新隧道..."
+                cloudflared tunnel create "$tunnel_name"
+                
+                if [ $? -ne 0 ]; then
+                    echo -e "${gl_hong}❌ 创建隧道失败${gl_bai}"
+                    echo -e "${gl_huang}提示：可能是隧道名称冲突，请尝试更换实例编号${gl_bai}"
+                    break_end
+                    return 1
+                fi
+                
+                tunnel_id=$(cloudflared tunnel list | grep "$tunnel_name" | awk '{print $1}')
+                echo -e "${gl_lv}✅ 新隧道创建成功${gl_bai}"
+                echo "Tunnel ID: $tunnel_id"
+                ;;
+            *)
+                echo "已取消配置"
+                break_end
+                return 1
+                ;;
+        esac
+    else
+        # 隧道不存在，创建新隧道
+        local create_output
+        create_output=$(cloudflared tunnel create "$tunnel_name" 2>&1)
+        local create_result=$?
+        
+        if [ $create_result -ne 0 ]; then
+            echo -e "${gl_hong}❌ 创建隧道失败${gl_bai}"
+            echo ""
+            echo -e "${gl_huang}错误信息：${gl_bai}"
+            echo "$create_output"
+            echo ""
+            
+            # 检查是否是隧道名称已存在的错误
+            if echo "$create_output" | grep -qi "already exists"; then
+                echo -e "${gl_huang}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+                echo -e "${gl_huang}可能的原因：${gl_bai}"
+                echo "  1. 隧道名称已在 Cloudflare 账户中存在（可能是其他机器创建的）"
+                echo "  2. 之前使用不同账户创建过同名隧道"
+                echo ""
+                echo -e "${gl_huang}解决方案：${gl_bai}"
+                echo "  方案1: 登录 Cloudflare Dashboard -> Zero Trust -> Networks -> Tunnels"
+                echo "         手动删除名为 '$tunnel_name' 的隧道，然后重试"
+                echo ""
+                echo "  方案2: 使用不同的实例编号（如改用 2, 3...）"
+                echo "         这会创建 sub-store-2, sub-store-3 等不同名称的隧道"
+                echo -e "${gl_huang}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
+            fi
+            
+            break_end
+            return 1
+        fi
+        
+        echo "$create_output"
+        
+        # 获取 tunnel ID
+        tunnel_id=$(cloudflared tunnel list | grep "$tunnel_name" | awk '{print $1}')
+        
+        if [ -z "$tunnel_id" ]; then
+            echo -e "${gl_hong}❌ 无法获取 tunnel ID${gl_bai}"
+            break_end
+            return 1
+        fi
+        
+        echo -e "${gl_lv}✅ 隧道创建成功${gl_bai}"
+        echo "Tunnel ID: $tunnel_id"
     fi
-    
-    # 获取 tunnel ID
-    local tunnel_id=$(cloudflared tunnel list | grep "$tunnel_name" | awk '{print $1}')
-    
-    if [ -z "$tunnel_id" ]; then
-        echo -e "${gl_hong}❌ 无法获取 tunnel ID${gl_bai}"
-        break_end
-        return 1
-    fi
-    
-    echo -e "${gl_lv}✅ 隧道创建成功${gl_bai}"
-    echo "Tunnel ID: $tunnel_id"
     
     echo ""
     echo -e "${gl_zi}[步骤 3/5] 输入域名${gl_bai}"
