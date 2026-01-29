@@ -63,13 +63,10 @@ uninstall_alias() {
     fi
     
     # 删除别名配置块
-    # 1. 尝试删除带注释块的旧格式
     sed -i '/^# ================/,/^alias dog=/d' "$RC_FILE" 2>/dev/null || true
-    
-    # 2. 删除新格式 (利用 sed 范围删除)
     sed -i '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" 2>/dev/null || true
     
-    # 3. 清理可能残留的 dog 别名
+    # 清理可能残留的 dog 别名
     if grep -q "alias dog=" "$RC_FILE"; then
         grep -v "alias dog=" "$RC_FILE" > "${RC_FILE}.tmp" && mv "${RC_FILE}.tmp" "$RC_FILE"
     fi
@@ -89,24 +86,17 @@ install_alias() {
     echo -e "配置文件: ${GREEN}${RC_FILE}${NC}"
     echo ""
 
-    # 定义要写入的别名内容 (关键修改点：URL已替换为变量，请确保推送到您自己的仓库)
-    # ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
-    # 请修改下方的 YourName/YourRepo 为您实际的 GitHub 用户名和仓库名
-    # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
-    
-    local REPO_PATH="YourName/YourRepo" 
-    
+    # ⚠️ 这里已经修改为你自己的仓库地址
     ALIAS_CONTENT='
 # net-tcp-tune 快捷别名
-alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/'"${REPO_PATH}"'/main/net-tcp-tune.sh?\$(date +%s)\")"
-alias dog="bash <(curl -fsSL \"https://raw.githubusercontent.com/'"${REPO_PATH}"'/main/Eric_port-traffic-dog.sh?\$(date +%s)\")"
+alias bbr="bash <(curl -fsSL \"https://raw.githubusercontent.com/rrkai/vps-tcp-tune/main/net-tcp-tune.sh?\$(date +%s)\")"
+alias dog="bash <(curl -fsSL \"https://raw.githubusercontent.com/rrkai/vps-tcp-tune/main/Eric_port-traffic-dog.sh?\$(date +%s)\")"
 '
 
     # 检查别名是否已存在
     if grep -q "net-tcp-tune 快捷别名" "$RC_FILE" 2>/dev/null; then
         echo -e "${YELLOW}配置已存在，正在更新...${NC}"
         
-        # 备份文件
         cp "$RC_FILE" "${RC_FILE}.bak"
         
         # 清理旧配置
@@ -116,17 +106,14 @@ alias dog="bash <(curl -fsSL \"https://raw.githubusercontent.com/'"${REPO_PATH}"
              sed -i '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE"
         fi
 
-        # 暴力清理残留的 alias dog=
         if grep -q "alias dog=" "$RC_FILE"; then
             grep -v "alias dog=" "$RC_FILE" > "${RC_FILE}.tmp" && mv "${RC_FILE}.tmp" "$RC_FILE"
         fi
         
-        # 追加新配置
         echo "$ALIAS_CONTENT" >> "$RC_FILE"
         echo -e "${GREEN}✅ 别名已更新到 ${RC_FILE}${NC}"
         echo ""
     else
-        # 添加别名到配置文件
         echo "$ALIAS_CONTENT" >> "$RC_FILE"
         echo -e "${GREEN}✅ 别名已添加到 ${RC_FILE}${NC}"
         echo ""
@@ -150,7 +137,6 @@ alias dog="bash <(curl -fsSL \"https://raw.githubusercontent.com/'"${REPO_PATH}"
     echo ""
 }
 
-# 执行主逻辑
 if [ "$MODE" = "uninstall" ]; then
     uninstall_alias
 else
